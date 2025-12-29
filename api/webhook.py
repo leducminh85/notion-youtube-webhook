@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv  # dùng local thì mở, deploy vercel thì tắt
+# from dotenv import load_dotenv  # dùng local thì mở, deploy vercel thì tắt
 import os
 import json
 import time
@@ -7,7 +7,7 @@ import requests
 from typing import Dict, List, Optional
 from datetime import datetime
 
-load_dotenv()
+# load_dotenv()
 
 app = Flask(__name__)
 NOTION_VERSION = "2022-06-28"
@@ -482,8 +482,132 @@ def webhook():
         # trả lỗi rõ để debug nhanh
         return jsonify({"status": "error", "message": str(e)}), 500
 
+def notion_retrieve_page(notion_api_key: str, page_id: str) -> dict:
+    r = requests.get(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=notion_headers(notion_api_key),
+    )
+    if r.status_code >= 300:
+        raise ValueError(f"Retrieve page failed: {r.status_code} {r.text}")
+    return r.json()
+
+def notion_get_database_schema(notion_api_key: str, database_id: str) -> dict:
+    r = requests.get(
+        f"https://api.notion.com/v1/databases/{database_id}",
+        headers=notion_headers(notion_api_key),
+    )
+    if r.status_code >= 300:
+        raise ValueError(f"Retrieve database schema failed: {r.status_code} {r.text}")
+
+    db = r.json()
+    props = db.get("properties", {})
+    return {name: meta.get("type") for name, meta in props.items() if meta.get("type")}
+
+def notion_update_page_properties(notion_api_key: str, page_id: str, props: dict) -> dict:
+    r = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=notion_headers(notion_api_key),
+        json={"properties": props},
+    )
+    if r.status_code >= 300:
+        raise ValueError(f"Update page failed: {r.status_code} {r.text}")
+    return r.json()
+
+def notion_prop_text(value: str, prop_type: str) -> dict:
+    value = (value or "").strip()
+    if prop_type == "title":
+        return {"title": [{"type": "text", "text": {"content": value}}]} if value else {"title": []}
+    return {"rich_text": [{"type": "text", "text": {"content": value}}]} if value else {"rich_text": []}
+
+
+
+@app.route("/update", methods=["POST"])
+def update_channel_only():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+
+    try:
+        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
+        notion_api_key = os.environ.get("NOTION_API_KEY")
+        if not yt_api_key or not notion_api_key:
+            raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
+
+        # Accept 2 formats:
+        # A) webhook style: { data: { id, parent: {database_id}, properties: {...}}}
+        # B) manual style: { "page_id": "xxxx" }
+        data = payload.get("data", {})
+        page_id = (data.get("id") or payload.get("page_id"))
+        if not page_id:
+            raise ValueError("Missing page_id (expected data.id or page_id)")
+
+        # Always retrieve full page to get reliable properties & parent database
+        page = notion_retrieve_page(notion_api_key, page_id)
+        props = page.get("properties", {})
+
+        channel_url = get_property_value(props, "Channel URL")
+        if not channel_url:
+            raise ValueError("Missing property: Channel URL")
+
+        # Find the database that contains this row (Channels DB)
+        triggering_db_id = page.get("parent", {}).get("database_id") or data.get("parent", {}).get("database_id")
+        if not triggering_db_id:
+            raise ValueError("Missing parent database_id (cannot identify Channels database)")
+
+        # YouTube: stats + upload frequency
+        channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+        stats = youtube_get_channel_stats(yt_api_key, channel_id)
+        freq = get_upload_frequency(yt_api_key, channel_id)
+
+        # Read schema to avoid type mismatch
+        schema = notion_get_database_schema(notion_api_key, triggering_db_id)
+
+        OUT_TITLE = "Tên kênh"
+        OUT_SUBS = "Subcriber"
+        OUT_VIDEOS = "Số video"
+        OUT_VIEWS = "Tổng view"
+        OUT_FREQ = "Chu kì đăng video"
+
+        update_props = {}
+
+        # Text fields
+        if OUT_TITLE in schema and schema[OUT_TITLE] in ("title", "rich_text"):
+            update_props[OUT_TITLE] = notion_prop_text(stats["title"], schema[OUT_TITLE])
+        if OUT_FREQ in schema and schema[OUT_FREQ] in ("title", "rich_text"):
+            update_props[OUT_FREQ] = notion_prop_text(freq, schema[OUT_FREQ])
+
+        # Number fields
+        if OUT_SUBS in schema and schema[OUT_SUBS] == "number":
+            update_props[OUT_SUBS] = {"number": stats["subscriberCount"]}
+        if OUT_VIDEOS in schema and schema[OUT_VIDEOS] == "number":
+            update_props[OUT_VIDEOS] = {"number": stats["videoCount"]}
+        if OUT_VIEWS in schema and schema[OUT_VIEWS] == "number":
+            update_props[OUT_VIEWS] = {"number": stats["viewCount"]}
+
+        if not update_props:
+            raise ValueError("No matching output properties found in database schema. Check column names/types.")
+
+        notion_update_page_properties(notion_api_key, page_id, update_props)
+
+        return jsonify({
+            "status": "success",
+            "message": "Updated channel stats only (no video sync)",
+            "page_id": page_id,
+            "database_id": triggering_db_id,
+            "channel_id": channel_id,
+            "channel_title": stats["title"],
+            "subscriber": stats["subscriberCount"],
+            "video_count": stats["videoCount"],
+            "total_views": stats["viewCount"],
+            "upload_frequency": freq
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 
 # ⚠️ Deploy Vercel: KHÔNG dùng app.run()
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host="0.0.0.0", port=port)
