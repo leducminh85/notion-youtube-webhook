@@ -1,150 +1,369 @@
 from flask import Flask, request, jsonify
-import json
-import requests
+from dotenv import load_dotenv
 import os
+import json
+import time
+import requests
+from typing import Dict, List, Optional
+
+# Load .env (đặt cùng cấp file app.py)
+load_dotenv()
 
 app = Flask(__name__)
+NOTION_VERSION = "2022-06-28"
 
-@app.route('/webhook', methods=['POST'])
+# -------------------------
+# Helpers
+# -------------------------
+def notion_headers(notion_api_key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {notion_api_key}",
+        "Content-Type": "application/json",
+        "Notion-Version": NOTION_VERSION
+    }
+
+def safe_json(resp: requests.Response) -> dict:
+    try:
+        return resp.json()
+    except Exception:
+        return {"_raw": resp.text}
+
+def get_property_value(props: dict, prop_name: str):
+    """Read value from Notion property inside webhook payload."""
+    prop = props.get(prop_name)
+    if prop is None:
+        return None
+    if isinstance(prop, str):
+        return prop
+    if isinstance(prop, dict) and prop.get("text", {}).get("content"):
+        return prop["text"]["content"]
+    if isinstance(prop, dict) and "rich_text" in prop and prop["rich_text"]:
+        return "".join(seg.get("text", {}).get("content", "") for seg in prop["rich_text"]) or None
+    if isinstance(prop, dict) and "title" in prop and prop["title"]:
+        return "".join(seg.get("text", {}).get("content", "") for seg in prop["title"]) or None
+    if isinstance(prop, dict) and "url" in prop:
+        return prop["url"]
+    return None
+
+def get_page_tong_id_from_database(notion_api_key: str, database_id: str) -> str:
+    """Get container page_id (page tổng) that contains the triggering database."""
+    r = requests.get(
+        f"https://api.notion.com/v1/databases/{database_id}",
+        headers=notion_headers(notion_api_key)
+    )
+    if r.status_code >= 300:
+        raise ValueError(f"Retrieve database failed: {r.status_code} {r.text}")
+
+    db = r.json()
+    parent = db.get("parent", {})
+    if parent.get("type") == "page_id":
+        return parent["page_id"]
+
+    # Rare case: database inside another database
+    if parent.get("type") == "database_id":
+        return parent["database_id"]
+
+    raise ValueError(f"Unsupported database parent type: {parent}")
+
+# -------------------------
+# YouTube helpers
+# -------------------------
+def youtube_channel_id_from_url(yt_api_key: str, channel_url: str) -> str:
+    """Support /channel/UC... or /@handle."""
+    if "/channel/" in channel_url:
+        return channel_url.split("/channel/")[1].split("?")[0].strip("/")
+    if "/@" in channel_url:
+        handle = channel_url.split("/@")[1].split("?")[0].strip("/")
+        r = requests.get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            params={"forHandle": handle, "key": yt_api_key, "part": "id"}
+        )
+        jd = safe_json(r)
+        if not jd.get("items"):
+            raise ValueError("Channel not found by handle")
+        return jd["items"][0]["id"]
+    raise ValueError("Invalid channel URL format. Use /channel/UC... or /@handle")
+
+def youtube_get_channel_title(yt_api_key: str, channel_id: str) -> str:
+    r = requests.get(
+        "https://www.googleapis.com/youtube/v3/channels",
+        params={"id": channel_id, "key": yt_api_key, "part": "snippet"}
+    )
+    jd = safe_json(r)
+    if not jd.get("items"):
+        raise ValueError("Channel not found (snippet)")
+    return jd["items"][0]["snippet"]["title"]
+
+def youtube_uploads_playlist_id(yt_api_key: str, channel_id: str) -> str:
+    r = requests.get(
+        "https://www.googleapis.com/youtube/v3/channels",
+        params={"id": channel_id, "key": yt_api_key, "part": "contentDetails"}
+    )
+    jd = safe_json(r)
+    if not jd.get("items"):
+        raise ValueError("Channel not found (contentDetails)")
+    return jd["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+def youtube_playlist_videos_basic(yt_api_key: str, uploads_playlist_id: str, limit: int = 100) -> List[dict]:
+    """
+    Returns list of items with snippet.resourceId.videoId, snippet.title, snippet.publishedAt, snippet.description, snippet.thumbnails
+    """
+    videos = []
+    next_page_token = None
+
+    while len(videos) < limit:
+        params = {
+            "playlistId": uploads_playlist_id,
+            "key": yt_api_key,
+            "part": "snippet",
+            "maxResults": 50
+        }
+        if next_page_token:
+            params["pageToken"] = next_page_token
+
+        r = requests.get("https://www.googleapis.com/youtube/v3/playlistItems", params=params)
+        jd = safe_json(r)
+
+        items = jd.get("items", [])
+        items = [
+            it for it in items
+            if it.get("snippet", {}).get("title") not in ("Private video", "Deleted video")
+        ]
+        videos.extend(items)
+
+        next_page_token = jd.get("nextPageToken")
+        if not next_page_token:
+            break
+
+    return videos[:limit]
+
+def youtube_get_view_counts(yt_api_key: str, video_ids: List[str]) -> Dict[str, int]:
+    """
+    Fetch viewCount for many videos using videos.list (max 50 ids/request).
+    Returns: { video_id: view_count_int }
+    """
+    out: Dict[str, int] = {}
+
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i+50]
+        r = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "id": ",".join(batch),
+                "key": yt_api_key,
+                "part": "statistics"
+            }
+        )
+        jd = safe_json(r)
+        for item in jd.get("items", []):
+            vid = item.get("id")
+            stats = item.get("statistics", {})
+            vc = stats.get("viewCount")
+            if vid and vc is not None:
+                try:
+                    out[vid] = int(vc)
+                except Exception:
+                    out[vid] = 0
+
+        # nhẹ nhàng tránh quota spike
+        time.sleep(0.15)
+
+    return out
+
+# -------------------------
+# Notion helpers
+# -------------------------
+def notion_create_database_under_page(
+    notion_api_key: str,
+    parent_page_id: str,
+    db_title: str
+) -> str:
+    """
+    Create a database under page tổng with required properties.
+    Adds Views (number) + Description (rich_text).
+    Published is date (includes time).
+    """
+    payload = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": db_title}}],
+        "properties": {
+            "Title": {"title": {}},
+            "Video URL": {"url": {}},
+            "Published": {"date": {}},          # includes time from ISO publishedAt
+            "Views": {"number": {"format": "number"}},
+            "Description": {"rich_text": {}},
+            "Thumbnail": {"files": {}}
+        }
+    }
+
+    r = requests.post(
+        "https://api.notion.com/v1/databases",
+        headers=notion_headers(notion_api_key),
+        json=payload
+    )
+    if r.status_code >= 300:
+        raise ValueError(f"Create database failed: {r.status_code} {r.text}")
+
+    return r.json()["id"]
+
+def notion_insert_video_row(
+    notion_api_key: str,
+    database_id: str,
+    title: str,
+    video_url: str,
+    published_at_iso: str,
+    views: int,
+    description: str,
+    thumbnail_url: Optional[str]
+):
+    # Notion rich_text has limits; keep description reasonable
+    desc = (description or "").strip()
+    if len(desc) > 1800:
+        desc = desc[:1800] + "…"
+
+    props = {
+        "Title": {"title": [{"text": {"content": title}}]},
+        "Video URL": {"url": video_url},
+        "Published": {"date": {"start": published_at_iso}},
+        "Views": {"number": views},
+        "Description": {"rich_text": [{"text": {"content": desc}}]} if desc else {"rich_text": []},
+    }
+
+    if thumbnail_url:
+        props["Thumbnail"] = {
+            "files": [{"name": "thumbnail", "type": "external", "external": {"url": thumbnail_url}}]
+        }
+    else:
+        props["Thumbnail"] = {"files": []}
+
+    payload = {"parent": {"database_id": database_id}, "properties": props}
+
+    r = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=notion_headers(notion_api_key),
+        json=payload
+    )
+
+    if r.status_code == 429:
+        time.sleep(1.5)
+        r = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=notion_headers(notion_api_key),
+            json=payload
+        )
+
+    if r.status_code >= 300:
+        print("Insert failed:", r.status_code, r.text)
+
+# -------------------------
+# Route
+# -------------------------
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    # === LOG TOÀN BỘ PAYLOAD ĐỂ DEBUG ===
     print("=== Headers ===")
     print(request.headers)
-    
-    try:
-        payload = request.json
-        print("=== Payload JSON ===")
-        print(json.dumps(payload, indent=4, ensure_ascii=False))
-    except json.JSONDecodeError:
-        print("=== Raw Body (không phải JSON) ===")
-        print(request.data.decode('utf-8'))
-        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        print("=== Raw Body (not JSON) ===")
+        print(request.data.decode("utf-8", errors="replace"))
+        return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+
+    print("=== Payload JSON ===")
+    print(json.dumps(payload, indent=4, ensure_ascii=False))
 
     try:
-        data = payload.get('data', {})
-        props = data.get('properties', {})
+        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
+        notion_api_key = os.environ.get("NOTION_API_KEY")
+        if not yt_api_key or not notion_api_key:
+            raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
 
-        def get_property_value(prop_name, type_hint='text'):
-            prop = props.get(prop_name)
-            if prop is None:
-                return None
+        data = payload.get("data", {})
+        props = data.get("properties", {})
 
-            # Case A: flattened string
-            if isinstance(prop, str):
-                return prop
+        # Property name per your real payload
+        channel_url = get_property_value(props, "Channel URL")
+        if not channel_url:
+            raise ValueError("Missing property: Channel URL")
 
-            # Case Postman-mock: { text: { content } }
-            if prop.get('text', {}).get('content'):
-                return prop['text']['content']
+        # Database that triggered this row
+        parent = data.get("parent", {})
+        triggering_db_id = parent.get("database_id")
+        if not triggering_db_id:
+            raise ValueError("Missing data.parent.database_id (trigger must be a database row)")
 
-            # Real Notion: rich_text
-            if 'rich_text' in prop and len(prop['rich_text']) > 0:
-                value = ''
-                for segment in prop['rich_text']:
-                    if 'text' in segment and 'content' in segment['text']:
-                        value += segment['text']['content']
-                return value if value else None
+        # page tổng that contains the triggering database
+        page_tong_id = get_page_tong_id_from_database(notion_api_key, triggering_db_id)
 
-            # Real Notion: title
-            if 'title' in prop and len(prop['title']) > 0:
-                value = ''
-                for segment in prop['title']:
-                    if 'text' in segment and 'content' in segment['text']:
-                        value += segment['text']['content']
-                return value if value else None
+        # YouTube: channel_id + channel title (for DB title)
+        channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+        channel_title = youtube_get_channel_title(yt_api_key, channel_id)
 
-            # URL
-            if 'url' in prop:
-                return prop['url']
+        # YouTube: uploads playlist + basic video list
+        uploads_id = youtube_uploads_playlist_id(yt_api_key, channel_id)
+        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=100)
 
-            return None
+        # Collect video IDs then fetch views in batch
+        video_ids = []
+        for it in items:
+            vid = it.get("snippet", {}).get("resourceId", {}).get("videoId")
+            if vid:
+                video_ids.append(vid)
 
-        yt_api_key = get_property_value('YouTube API Key')
-        notion_api_key = get_property_value('Notion API Key')
-        channel_url = get_property_value('YouTube Channel URL')
-        page_id = get_property_value('page_id')
+        views_map = youtube_get_view_counts(yt_api_key, video_ids)
 
-        if not all([yt_api_key, notion_api_key, channel_url, page_id]):
-            raise ValueError('Missing required properties: YouTube API Key, Notion API Key, Channel URL, or page_id')
+        # Create new database under page tổng: title = channel name
+        new_db_id = notion_create_database_under_page(notion_api_key, page_tong_id, channel_title)
 
-        # Bước 1: Lấy Channel ID từ URL
-        channel_id = None
-        if '/channel/' in channel_url:
-            channel_id = channel_url.split('/channel/')[1].split('?')[0]
-        elif '/@' in channel_url:
-            handle = channel_url.split('/@')[1].split('?')[0]
-            channels_url = f"https://www.googleapis.com/youtube/v3/channels?forHandle={handle}&key={yt_api_key}&part=id"
-            channels_response = requests.get(channels_url)
-            channels_data = channels_response.json()
-            if not channels_data.get('items') or len(channels_data['items']) == 0:
-                raise ValueError('Channel not found by handle')
-            channel_id = channels_data['items'][0]['id']
-        else:
-            raise ValueError('Invalid channel URL format')
+        # Insert each video
+        for it in items:
+            sn = it.get("snippet", {})
+            title = sn.get("title", "Untitled")
+            published = sn.get("publishedAt")
+            description = sn.get("description", "")
+            vid = sn.get("resourceId", {}).get("videoId")
 
-        # Bước 2: Lấy Uploads Playlist ID
-        channel_url = f"https://www.googleapis.com/youtube/v3/channels?id={channel_id}&key={yt_api_key}&part=contentDetails"
-        channel_response = requests.get(channel_url)
-        channel_data = channel_response.json()
-        if not channel_data.get('items') or len(channel_data['items']) == 0:
-            raise ValueError('Channel not found')
-        uploads_playlist_id = channel_data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+            if not vid or not published:
+                continue
 
-        # Bước 3: Lấy danh sách video (tối đa 100)
-        videos = []
-        next_page_token = ''
-        while len(videos) < 100 and next_page_token is not None:
-            url = f"https://www.googleapis.com/youtube/v3/playlistItems?playlistId={uploads_playlist_id}&key={yt_api_key}&part=snippet&maxResults=50&pageToken={next_page_token}"
-            playlist_response = requests.get(url)
-            playlist_data = playlist_response.json()
-            filtered_items = [item for item in playlist_data.get('items', []) if item['snippet']['title'] not in ['Private video', 'Deleted video']]
-            videos.extend(filtered_items)
-            next_page_token = playlist_data.get('nextPageToken', None)
+            thumbs = sn.get("thumbnails", {})
+            thumb_url = (
+                thumbs.get("high", {}).get("url")
+                or thumbs.get("medium", {}).get("url")
+                or thumbs.get("default", {}).get("url")
+            )
 
-        # Bước 4: Tạo database mới trong Notion
-        notion_headers = {
-            'Authorization': f'Bearer {notion_api_key}',
-            'Content-Type': 'application/json',
-            'Notion-Version': '2022-06-28'
-        }
+            video_url = f"https://www.youtube.com/watch?v={vid}"
+            views = views_map.get(vid, 0)
 
-        database_payload = {
-            'parent': {'type': 'page_id', 'page_id': page_id},
-            'title': [{'type': 'text', 'text': {'content': f'YouTube Videos - {channel_id}'}}],
-            'properties': {
-                'Title': {'title': {}},
-                'Video URL': {'url': {}},
-                'Published': {'date': {}},
-                'Thumbnail': {'files': {}}  # Thay url thành files để thumbnail hiển thị đẹp hơn (external)
-            }
-        }
+            notion_insert_video_row(
+                notion_api_key=notion_api_key,
+                database_id=new_db_id,
+                title=title,
+                video_url=video_url,
+                published_at_iso=published,  # includes time => "giờ đăng"
+                views=views,
+                description=description,
+                thumbnail_url=thumb_url
+            )
 
-        create_db_response = requests.post('https://api.notion.com/v1/databases', headers=notion_headers, json=database_payload)
-        new_db = create_db_response.json()
-        new_db_id = new_db['id']
+            time.sleep(0.35)  # tránh Notion 429
 
-        # Bước 5: Thêm videos vào database
-        for video in videos:
-            snippet = video['snippet']
-            video_payload = {
-                'parent': {'database_id': new_db_id},
-                'properties': {
-                    'Title': {'title': [{'text': {'content': snippet['title']}}]},
-                    'Video URL': {'url': f"https://www.youtube.com/watch?v={snippet['resourceId']['videoId']}"},
-                    'Published': {'date': {'start': snippet['publishedAt']}},
-                    'Thumbnail': {'files': [{'name': 'thumbnail', 'type': 'external', 'external': {'url': snippet['thumbnails'].get('high', {}).get('url') or snippet['thumbnails'].get('default', {}).get('url')}}]}
-                }
-            }
+        return jsonify({
+            "status": "success",
+            "message": "Created channel database under page tổng",
+            "page_tong_id": page_tong_id,
+            "channel_id": channel_id,
+            "channel_title": channel_title,
+            "new_database_id": new_db_id,
+            "video_count": len(items)
+        }), 200
 
-            requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=video_payload)
+    except Exception as e:
+        print("Error:", str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-        # Trả về response thành công
-        return jsonify({"status": "success", "message": "Webhook processed successfully!"}), 200
-
-    except Exception as error:
-        print(f'Error: {str(error)}')
-        return jsonify({"status": "error", "message": str(error)}), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
