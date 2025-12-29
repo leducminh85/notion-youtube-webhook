@@ -1,13 +1,12 @@
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+# from dotenv import load_dotenv  
 import os
 import json
 import time
 import requests
 from typing import Dict, List, Optional
 
-# Load .env (đặt cùng cấp file app.py)
-load_dotenv()
+# load_dotenv()
 
 app = Flask(__name__)
 NOTION_VERSION = "2022-06-28"
@@ -364,6 +363,6 @@ def webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host="0.0.0.0", port=port)
