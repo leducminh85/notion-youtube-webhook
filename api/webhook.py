@@ -1,12 +1,12 @@
 from flask import Flask, request, jsonify
-# from dotenv import load_dotenv  
+from dotenv import load_dotenv  
 import os
 import json
 import time
 import requests
 from typing import Dict, List, Optional
 
-# load_dotenv()
+load_dotenv()
 
 app = Flask(__name__)
 NOTION_VERSION = "2022-06-28"
@@ -103,14 +103,15 @@ def youtube_uploads_playlist_id(yt_api_key: str, channel_id: str) -> str:
         raise ValueError("Channel not found (contentDetails)")
     return jd["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
-def youtube_playlist_videos_basic(yt_api_key: str, uploads_playlist_id: str, limit: int = 100) -> List[dict]:
-    """
-    Returns list of items with snippet.resourceId.videoId, snippet.title, snippet.publishedAt, snippet.description, snippet.thumbnails
-    """
-    videos = []
-    next_page_token = None
+def youtube_playlist_videos_basic(
+    yt_api_key: str,
+    uploads_playlist_id: str,
+    limit: Optional[int] = None
+) -> List[dict]:
+    videos: List[dict] = []
+    next_page_token: Optional[str] = None
 
-    while len(videos) < limit:
+    while True:
         params = {
             "playlistId": uploads_playlist_id,
             "key": yt_api_key,
@@ -128,14 +129,21 @@ def youtube_playlist_videos_basic(yt_api_key: str, uploads_playlist_id: str, lim
             it for it in items
             if it.get("snippet", {}).get("title") not in ("Private video", "Deleted video")
         ]
+
         videos.extend(items)
+
+        # stop if reached limit (if limit is set)
+        if limit is not None and len(videos) >= limit:
+            return videos[:limit]
 
         next_page_token = jd.get("nextPageToken")
         if not next_page_token:
             break
 
-    return videos[:limit]
+        # gentle quota pacing
+        time.sleep(0.05)
 
+    return videos
 def youtube_get_view_counts(yt_api_key: str, video_ids: List[str]) -> Dict[str, int]:
     """
     Fetch viewCount for many videos using videos.list (max 50 ids/request).
@@ -300,7 +308,7 @@ def webhook():
 
         # YouTube: uploads playlist + basic video list
         uploads_id = youtube_uploads_playlist_id(yt_api_key, channel_id)
-        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=100)
+        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=None)
 
         # Collect video IDs then fetch views in batch
         video_ids = []
@@ -363,6 +371,6 @@ def webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# if __name__ == "__main__":
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host="0.0.0.0", port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
