@@ -8,6 +8,7 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from curl_cffi import requests as cffi_requests  # Import thư viện giả lập trình duyệt
 
 # load_dotenv()
 
@@ -947,6 +948,133 @@ def update_channel_detail():
 
     except Exception as e:
         logger.exception("/update-channel-detail failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+def vidiq_get_30_day_views(channel_id: str) -> int:
+    """
+    Gọi vidIQ API dùng curl_cffi để bypass Cloudflare.
+    """
+    vidiq_token = os.environ.get("VIDIQ_BEARER_TOKEN")
+    
+    url = f"https://api.vidiq.com/youtube/channels/public/channel-pages/{channel_id}"
+    
+    # Cần giả lập Header giống hệt trình duyệt
+    headers = {
+        "accept": "*/*",
+        "accept-language": "vi,en;q=0.9,vi-VN;q=0.8",
+        "authorization": f"Bearer {vidiq_token}",
+        "content-type": "application/json",
+        "priority": "u=1, i",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "none",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", # Bắt buộc có User-Agent thật
+        "x-amplitude-device-id": "a3027017-5f82-4eb0-b97b-3c01ef5fa8a0",
+        "x-vidiq-client": "ext vch/3.168.0"
+    }
+
+    try:
+        # Sử dụng cffi_requests với tham số impersonate="chrome"
+        r = cffi_requests.get(url, headers=headers, impersonate="chrome110", timeout=30)
+        
+        if r.status_code >= 300:
+            logger.error(f"VidIQ API Error: {r.status_code} {r.text[:200]}") # Log 200 ký tự đầu để xem lỗi
+            return 0 
+
+        data = r.json()
+        
+        # 1. Lấy dữ liệu cần thiết
+        current_stats = data.get("current_stats", {}).get("views", {})
+        daily_stats = data.get("daily_stats", [])
+
+        if not daily_stats or len(daily_stats) < 2:
+            logger.warning("VidIQ: Không đủ dữ liệu daily_stats để tính toán")
+            return 0
+
+        # 2. Tính view của ngày hiện tại (Real-time delta)
+        current_total_views = current_stats.get("count", 0)
+        yesterday_total_views = daily_stats[1].get("views", 0)
+        
+        views_today_realtime = current_total_views - yesterday_total_views
+        if views_today_realtime < 0:
+            views_today_realtime = 0
+
+        # 3. Tính tổng view change của 29 ngày trước đó
+        past_days_stats = daily_stats[1:30] 
+        views_past_29_days = sum(day.get("views_change", 0) for day in past_days_stats)
+
+        # 4. Tổng hợp
+        total_30_days = views_today_realtime + views_past_29_days
+        
+        logger.info(f"VidIQ calc for {channel_id}: Today({views_today_realtime}) + Past29({views_past_29_days}) = {total_30_days}")
+        return total_30_days
+
+    except Exception as e:
+        logger.exception(f"Lỗi khi tính toán view VidIQ cho {channel_id}: {e}")
+        return 0
+# -------------------------
+# New Route
+# -------------------------
+@app.route("/get-channel-views-monthly", methods=["POST"])
+def get_channel_views_monthly():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+
+    try:
+        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
+        notion_api_key = os.environ.get("NOTION_API_KEY")
+        
+        if not yt_api_key or not notion_api_key:
+            raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
+
+        # Hỗ trợ payload webhook hoặc payload test thủ công
+        data = payload.get("data", {})
+        page_id = data.get("id") or payload.get("page_id")
+        
+        if not page_id:
+            raise ValueError("Missing page_id")
+
+        # 1. Lấy thông tin Page Notion để tìm Channel URL
+        logger.info(f"Retrieving Notion page {page_id} for monthly views")
+        page = notion_retrieve_page(notion_api_key, page_id)
+        props = page.get("properties", {})
+
+        channel_url = get_property_value(props, "Channel URL")
+        if not channel_url:
+            raise ValueError("Missing property: Channel URL")
+
+        # 2. Chuyển đổi URL sang Channel ID (dùng Youtube API helper có sẵn)
+        channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+        
+        # 3. Gọi VidIQ để lấy số view 30 ngày
+        views_30_days = vidiq_get_30_day_views(channel_id)
+
+        # 4. Cập nhật lại vào Notion (Nếu có cột tương ứng)
+        triggering_db_id = page.get("parent", {}).get("database_id")
+        if triggering_db_id:
+            schema = notion_get_database_schema(notion_api_key, triggering_db_id)
+            OUT_VIEWS_MONTHLY = "Views (30 ngày)" # Tên cột trong Notion phải chính xác
+            
+            update_props = {}
+            if OUT_VIEWS_MONTHLY in schema and schema[OUT_VIEWS_MONTHLY] == "number":
+                update_props[OUT_VIEWS_MONTHLY] = {"number": views_30_days}
+            
+            if update_props:
+                notion_update_page_properties(notion_api_key, page_id, update_props)
+                logger.info(f"Updated page {page_id} with 30-day views: {views_30_days}")
+            else:
+                logger.warning(f"Column '{OUT_VIEWS_MONTHLY}' not found in Notion database or not a Number type.")
+
+        return jsonify({
+            "status": "success",
+            "page_id": page_id,
+            "channel_id": channel_id,
+            "views_30_days": views_30_days
+        }), 200
+
+    except Exception as e:
+        logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
     
 # if __name__ == "__main__":
