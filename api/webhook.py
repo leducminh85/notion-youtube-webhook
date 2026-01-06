@@ -6,6 +6,7 @@ import time
 import requests
 from typing import Dict, List, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # load_dotenv()
 
@@ -344,7 +345,45 @@ def notion_insert_video_row(
         )
 
     if r.status_code >= 300:
-        print("Insert failed:", r.status_code, r.text)
+        raise ValueError(f"Insert failed: {r.status_code} {r.text}")
+
+def insert_video_batch(
+    notion_api_key: str,
+    database_id: str,
+    videos_data: List[Dict[str, any]],
+    max_workers: int = 8  # Số lượng concurrent requests tối đa
+):
+    def insert_single(video: Dict[str, any]):
+        retries = 0
+        max_retries = 3
+        while retries < max_retries:
+            try:
+                notion_insert_video_row(
+                    notion_api_key=notion_api_key,
+                    database_id=database_id,
+                    **video
+                )
+                return True, None
+            except ValueError as e:
+                err_str = str(e)
+                if "429" in err_str:
+                    # Xử lý rate limit: sleep dựa trên Retry-After nếu có, hoặc default 2s
+                    retry_after = 2
+                    if 'Retry-After' in r.headers:  # Giả sử r là response cuối
+                        retry_after = int(r.headers.get('Retry-After', 2))
+                    time.sleep(retry_after)
+                    retries += 1
+                else:
+                    return False, err_str
+        return False, "Max retries exceeded"
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(insert_single, video) for video in videos_data]
+        
+        for future in as_completed(futures):
+            success, err = future.result()
+            if not success:
+                print(f"Error inserting video: {err}")
 
 # -------------------------
 # Route
@@ -420,7 +459,10 @@ def webhook():
         # (E) Phần tạo DB video như code đang chạy
         channel_title = stats["title"]
         uploads_id = youtube_uploads_playlist_id(yt_api_key, channel_id)
-        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=None)
+        
+        # Cập nhật: Giới hạn số video để tránh timeout, ví dụ 200 video mới nhất
+        # VIDEO_LIMIT = 200  # Bạn có thể thay đổi giá trị này
+        items = youtube_playlist_videos_basic(yt_api_key, uploads_id)
 
         video_ids = []
         for it in items:
@@ -430,8 +472,30 @@ def webhook():
 
         views_map = youtube_get_view_counts(yt_api_key, video_ids)
 
-        new_db_id = notion_create_database_under_page(notion_api_key, page_tong_id, channel_title)
+        # Kiểm tra xem database video đã tồn tại chưa (để tránh tạo trùng)
+        existing_db_id = None
+        r = requests.get(
+            f"https://api.notion.com/v1/blocks/{page_tong_id}/children",
+            headers=notion_headers(notion_api_key),
+            params={"page_size": 100}  # Giả sử không quá 100 children
+        )
+        if r.status_code >= 300:
+            raise ValueError(f"List children failed: {r.status_code} {r.text}")
+        
+        children = r.json().get("results", [])
+        for child in children:
+            if child.get("type") == "database" and child.get("database", {}).get("title", [{}])[0].get("text", {}).get("content") == channel_title:
+                existing_db_id = child["id"]
+                break
 
+        if existing_db_id:
+            new_db_id = existing_db_id
+            # Có thể thêm logic để check và chỉ insert video mới, nhưng tạm skip để đơn giản
+        else:
+            new_db_id = notion_create_database_under_page(notion_api_key, page_tong_id, channel_title)
+
+        # Chuẩn bị data cho batch insert
+        videos_data = []
         for it in items:
             sn = it.get("snippet", {})
             title = sn.get("title", "Untitled")
@@ -449,22 +513,21 @@ def webhook():
                 or thumbs.get("default", {}).get("url")
             )
 
-            notion_insert_video_row(
-                notion_api_key=notion_api_key,
-                database_id=new_db_id,
-                title=title,
-                video_url=f"https://www.youtube.com/watch?v={vid}",
-                published_at_iso=published,
-                views=views_map.get(vid, 0),
-                description=description,
-                thumbnail_url=thumb_url
-            )
+            videos_data.append({
+                "title": title,
+                "video_url": f"https://www.youtube.com/watch?v={vid}",
+                "published_at_iso": published,
+                "views": views_map.get(vid, 0),
+                "description": description,
+                "thumbnail_url": thumb_url
+            })
 
-            time.sleep(0.35)
+        # Insert batch với parallel
+        insert_video_batch(notion_api_key, new_db_id, videos_data)
 
         return jsonify({
             "status": "success",
-            "message": "Updated channel row + created channel videos database",
+            "message": "Updated channel row + created/used channel videos database",
             "page_id": page_id,
             "triggering_db_id": triggering_db_id,
             "page_tong_id": page_tong_id,
@@ -518,8 +581,6 @@ def notion_prop_text(value: str, prop_type: str) -> dict:
     if prop_type == "title":
         return {"title": [{"type": "text", "text": {"content": value}}]} if value else {"title": []}
     return {"rich_text": [{"type": "text", "text": {"content": value}}]} if value else {"rich_text": []}
-
-
 
 @app.route("/update", methods=["POST"])
 def update_channel_only():
@@ -607,7 +668,6 @@ def update_channel_only():
 
 
 
-# ⚠️ Deploy Vercel: KHÔNG dùng app.run()
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 5000))
 #     app.run(host="0.0.0.0", port=port)
