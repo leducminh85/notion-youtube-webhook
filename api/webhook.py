@@ -4,6 +4,7 @@ import os
 import json
 import time
 import requests
+import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 NOTION_VERSION = "2022-06-28"
+
+# Logging setup
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
 # -------------------------
 # Helpers
@@ -27,6 +32,7 @@ def safe_json(resp: requests.Response) -> dict:
     try:
         return resp.json()
     except Exception:
+        logger.debug("safe_json: failed to parse JSON, returning raw text", exc_info=True)
         return {"_raw": resp.text}
 
 def get_property_value(props: dict, prop_name: str):
@@ -53,6 +59,7 @@ def get_page_tong_id_from_database(notion_api_key: str, database_id: str) -> str
         headers=notion_headers(notion_api_key)
     )
     if r.status_code >= 300:
+        logger.error("Retrieve database failed: %s %s", r.status_code, r.text)
         raise ValueError(f"Retrieve database failed: {r.status_code} {r.text}")
 
     db = r.json()
@@ -70,6 +77,7 @@ def notion_get_database_schema(notion_api_key: str, database_id: str) -> dict:
         headers=notion_headers(notion_api_key),
     )
     if r.status_code >= 300:
+        logger.error("Retrieve database schema failed: %s %s", r.status_code, r.text)
         raise ValueError(f"Retrieve database schema failed: {r.status_code} {r.text}")
 
     db = r.json()
@@ -88,6 +96,7 @@ def notion_update_page_properties(notion_api_key: str, page_id: str, props: dict
         json={"properties": props},
     )
     if r.status_code >= 300:
+        logger.error("Update page failed for %s: %s %s", page_id, r.status_code, r.text)
         raise ValueError(f"Update page failed: {r.status_code} {r.text}")
     return r.json()
 
@@ -114,6 +123,7 @@ def youtube_channel_id_from_url(yt_api_key: str, channel_url: str) -> str:
         )
         jd = safe_json(r)
         if not jd.get("items"):
+            logger.error("youtube_channel_id_from_url: channel not found by handle %s (resp: %s)", handle, jd)
             raise ValueError("Channel not found by handle")
         return jd["items"][0]["id"]
     raise ValueError("Invalid channel URL format. Use /channel/UC... or /@handle")
@@ -125,6 +135,7 @@ def youtube_get_channel_title(yt_api_key: str, channel_id: str) -> str:
     )
     jd = safe_json(r)
     if not jd.get("items"):
+        logger.error("youtube_get_channel_title: channel not found (snippet) %s (resp: %s)", channel_id, jd)
         raise ValueError("Channel not found (snippet)")
     return jd["items"][0]["snippet"]["title"]
 
@@ -135,6 +146,7 @@ def youtube_get_channel_stats(yt_api_key: str, channel_id: str) -> dict:
     )
     jd = safe_json(r)
     if not jd.get("items"):
+        logger.error("youtube_get_channel_stats: channel not found %s (resp: %s)", channel_id, jd)
         raise ValueError("Channel not found (snippet,statistics)")
     it = jd["items"][0]
     sn = it.get("snippet", {})
@@ -153,6 +165,7 @@ def youtube_uploads_playlist_id(yt_api_key: str, channel_id: str) -> str:
     )
     jd = safe_json(r)
     if not jd.get("items"):
+        logger.error("youtube_uploads_playlist_id: channel not found %s (resp: %s)", channel_id, jd)
         raise ValueError("Channel not found (contentDetails)")
     return jd["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
@@ -246,6 +259,7 @@ def get_upload_frequency(yt_api_key: str, channel_id: str) -> str:
             try:
                 dates.append(datetime.fromisoformat(p.replace("Z", "+00:00")))
             except Exception:
+                logger.debug("get_upload_frequency: failed parsing publishedAt: %s", p, exc_info=True)
                 pass
 
         dates.sort(reverse=True)
@@ -270,6 +284,7 @@ def get_upload_frequency(yt_api_key: str, channel_id: str) -> str:
             return f"{videos_per_day} video / 1 ngày"
         return f"1 video / {round(avg_days)} ngày"
     except Exception:
+        logger.exception("get_upload_frequency failed for channel %s", channel_id)
         return "Lỗi khi lấy dữ liệu"
 
 # -------------------------
@@ -295,6 +310,7 @@ def notion_create_database_under_page(notion_api_key: str, parent_page_id: str, 
         json=payload
     )
     if r.status_code >= 300:
+        logger.error("Create database failed under page %s: %s %s", parent_page_id, r.status_code, r.text)
         raise ValueError(f"Create database failed: {r.status_code} {r.text}")
 
     return r.json()["id"]
@@ -337,6 +353,7 @@ def notion_insert_video_row(
     )
 
     if r.status_code == 429:
+        logger.warning("notion_insert_video_row: rate limited when inserting into %s; retrying once", database_id)
         time.sleep(1.5)
         r = requests.post(
             "https://api.notion.com/v1/pages",
@@ -345,6 +362,7 @@ def notion_insert_video_row(
         )
 
     if r.status_code >= 300:
+        logger.error("Insert failed into %s: %s %s", database_id, r.status_code, r.text)
         raise ValueError(f"Insert failed: {r.status_code} {r.text}")
 
 def insert_video_batch(
@@ -369,11 +387,16 @@ def insert_video_batch(
                 if "429" in err_str:
                     # Xử lý rate limit: sleep dựa trên Retry-After nếu có, hoặc default 2s
                     retry_after = 2
-                    if 'Retry-After' in r.headers:  # Giả sử r là response cuối
-                        retry_after = int(r.headers.get('Retry-After', 2))
+                    logger.warning("insert_single: rate limited for video %s; sleeping %ss (attempt %s)", video.get("video_url"), retry_after, retries+1)
+                    try:
+                        # best-effort: if the last response was captured in exception message, we cannot access r here
+                        pass
+                    except Exception:
+                        pass
                     time.sleep(retry_after)
                     retries += 1
                 else:
+                    logger.error("insert_single: failed inserting video %s: %s", video.get("video_url"), err_str)
                     return False, err_str
         return False, "Max retries exceeded"
 
@@ -383,7 +406,7 @@ def insert_video_batch(
         for future in as_completed(futures):
             success, err = future.result()
             if not success:
-                print(f"Error inserting video: {err}")
+                logger.error("Error inserting video: %s", err)
 
 # -------------------------
 # Route
@@ -393,11 +416,14 @@ def webhook():
     payload = request.get_json(silent=True)
     if not payload:
         return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+    logger.debug("/webhook received payload keys: %s", list(payload.keys()) if isinstance(payload, dict) else str(type(payload)))
 
     try:
         yt_api_key = os.environ.get("YOUTUBE_API_KEY")
         notion_api_key = os.environ.get("NOTION_API_KEY")
+        logger.debug("env presence - YT: %s, NOTION: %s", bool(yt_api_key), bool(notion_api_key))
         if not yt_api_key or not notion_api_key:
+            logger.error("Missing required environment variables YOUTUBE_API_KEY or NOTION_API_KEY")
             raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
 
         data = payload.get("data", {})
@@ -405,26 +431,36 @@ def webhook():
 
         # (A) Lấy channel_url như code đang chạy
         channel_url = get_property_value(props, "Channel URL")
+        logger.debug("Channel URL property value: %s", channel_url)
         if not channel_url:
+            logger.error("Missing property: Channel URL in properties: %s", list(props.keys()))
             raise ValueError("Missing property: Channel URL")
 
         # (B) Lấy database_id & page_tong_id như code đang chạy
         parent = data.get("parent", {})
         triggering_db_id = parent.get("database_id")
+        logger.debug("Triggering DB id from payload parent: %s", triggering_db_id)
         if not triggering_db_id:
+            logger.error("Missing data.parent.database_id (trigger must be a database row); parent: %s", parent)
             raise ValueError("Missing data.parent.database_id (trigger must be a database row)")
 
         page_tong_id = get_page_tong_id_from_database(notion_api_key, triggering_db_id)
 
         # (C) NEW: page_id của row hiện tại để update stats vào database Channels
         page_id = data.get("id")
+        logger.debug("Page id from payload: %s", page_id)
         if not page_id:
+            logger.error("Missing data.id (page id of the row) in data: %s", data)
             raise ValueError("Missing data.id (page id of the row)")
 
         # YouTube: channel stats + frequency
+        logger.info("Resolving channel id for url=%s", channel_url)
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+        logger.info("Resolved channel_id=%s", channel_id)
         stats = youtube_get_channel_stats(yt_api_key, channel_id)
+        logger.info("Channel stats fetched: subs=%s, videos=%s, views=%s", stats.get("subscriberCount"), stats.get("videoCount"), stats.get("viewCount"))
         freq = get_upload_frequency(yt_api_key, channel_id)
+        logger.info("Upload frequency: %s", freq)
 
         # (D) NEW: update row hiện tại theo schema thật của database Channels
         schema = notion_get_database_schema(notion_api_key, triggering_db_id)
@@ -454,6 +490,7 @@ def webhook():
 
         # chỉ update nếu có cột khớp schema
         if update_props:
+            logger.info("Updating notion page %s with props: %s", page_id, update_props)
             notion_update_page_properties(notion_api_key, page_id, update_props)
 
         # (E) Phần tạo DB video như code đang chạy
@@ -463,6 +500,7 @@ def webhook():
         # Cập nhật: Giới hạn số video để tránh timeout, ví dụ 200 video mới nhất
         # VIDEO_LIMIT = 200  # Bạn có thể thay đổi giá trị này
         items = youtube_playlist_videos_basic(yt_api_key, uploads_id)
+        logger.info("Fetched %s playlist items for uploads playlist %s", len(items), uploads_id)
 
         video_ids = []
         for it in items:
@@ -480,6 +518,7 @@ def webhook():
             params={"page_size": 100}  # Giả sử không quá 100 children
         )
         if r.status_code >= 300:
+            logger.error("List children failed for page_tong_id=%s: %s %s", page_tong_id, r.status_code, r.text)
             raise ValueError(f"List children failed: {r.status_code} {r.text}")
         
         children = r.json().get("results", [])
@@ -490,9 +529,11 @@ def webhook():
 
         if existing_db_id:
             new_db_id = existing_db_id
+            logger.info("Using existing videos database %s for channel %s", new_db_id, channel_title)
             # Có thể thêm logic để check và chỉ insert video mới, nhưng tạm skip để đơn giản
         else:
             new_db_id = notion_create_database_under_page(notion_api_key, page_tong_id, channel_title)
+            logger.info("Created new videos database %s for channel %s", new_db_id, channel_title)
 
         # Chuẩn bị data cho batch insert
         videos_data = []
@@ -523,6 +564,7 @@ def webhook():
             })
 
         # Insert batch với parallel
+        logger.info("Inserting %s videos into Notion database %s", len(videos_data), new_db_id)
         insert_video_batch(notion_api_key, new_db_id, videos_data)
 
         return jsonify({
@@ -542,6 +584,7 @@ def webhook():
         }), 200
 
     except Exception as e:
+        logger.exception("/webhook failed for payload; error: %s", e)
         # trả lỗi rõ để debug nhanh
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -587,11 +630,14 @@ def update_channel_only():
     payload = request.get_json(silent=True)
     if not payload:
         return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+    logger.debug("/update received payload keys: %s", list(payload.keys()) if isinstance(payload, dict) else str(type(payload)))
 
     try:
         yt_api_key = os.environ.get("YOUTUBE_API_KEY")
         notion_api_key = os.environ.get("NOTION_API_KEY")
+        logger.debug("env presence - YT: %s, NOTION: %s", bool(yt_api_key), bool(notion_api_key))
         if not yt_api_key or not notion_api_key:
+            logger.error("Missing required environment variables YOUTUBE_API_KEY or NOTION_API_KEY")
             raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
 
         # Accept 2 formats:
@@ -599,26 +645,34 @@ def update_channel_only():
         # B) manual style: { "page_id": "xxxx" }
         data = payload.get("data", {})
         page_id = (data.get("id") or payload.get("page_id"))
+        logger.debug("update_channel_only page_id resolved: %s", page_id)
         if not page_id:
+            logger.error("Missing page_id (expected data.id or page_id); payload keys: %s", list(payload.keys()))
             raise ValueError("Missing page_id (expected data.id or page_id)")
 
         # Always retrieve full page to get reliable properties & parent database
+        logger.info("Retrieving Notion page %s for update", page_id)
         page = notion_retrieve_page(notion_api_key, page_id)
         props = page.get("properties", {})
 
         channel_url = get_property_value(props, "Channel URL")
+        logger.debug("Channel URL from page: %s", channel_url)
         if not channel_url:
+            logger.error("Missing property: Channel URL on page %s", page_id)
             raise ValueError("Missing property: Channel URL")
 
         # Find the database that contains this row (Channels DB)
         triggering_db_id = page.get("parent", {}).get("database_id") or data.get("parent", {}).get("database_id")
         if not triggering_db_id:
+            logger.error("Missing parent database_id for page %s (cannot identify Channels database)", page_id)
             raise ValueError("Missing parent database_id (cannot identify Channels database)")
 
         # YouTube: stats + upload frequency
+        logger.info("Resolving channel info for page %s: url=%s", page_id, channel_url)
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
         stats = youtube_get_channel_stats(yt_api_key, channel_id)
         freq = get_upload_frequency(yt_api_key, channel_id)
+        logger.info("Fetched stats for channel %s: subs=%s videos=%s views=%s", channel_id, stats.get("subscriberCount"), stats.get("videoCount"), stats.get("viewCount"))
 
         # Read schema to avoid type mismatch
         schema = notion_get_database_schema(notion_api_key, triggering_db_id)
@@ -646,8 +700,10 @@ def update_channel_only():
             update_props[OUT_VIEWS] = {"number": stats["viewCount"]}
 
         if not update_props:
+            logger.error("No matching output properties found in database schema %s. Schema keys: %s", triggering_db_id, list(schema.keys()))
             raise ValueError("No matching output properties found in database schema. Check column names/types.")
 
+        logger.info("Updating page %s with props: %s", page_id, update_props)
         notion_update_page_properties(notion_api_key, page_id, update_props)
 
         return jsonify({
@@ -664,6 +720,7 @@ def update_channel_only():
         }), 200
 
     except Exception as e:
+        logger.exception("/update failed for page %s: %s", payload.get("page_id") or payload.get("data", {}).get("id"), e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
