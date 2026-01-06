@@ -470,8 +470,8 @@ def get_channel_detail():
 
         # --- Video database handling ---
         uploads_id = youtube_uploads_playlist_id(yt_api_key, channel_id)
-        VIDEO_LIMIT = 200  # Giới hạn để tránh timeout
-        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=VIDEO_LIMIT)
+        # VIDEO_LIMIT = 200  # Giới hạn để tránh timeout
+        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=None)
 
         video_ids = [it["snippet"]["resourceId"]["videoId"] for it in items if it.get("snippet", {}).get("resourceId", {}).get("videoId")]
         views_map = youtube_get_view_counts(yt_api_key, video_ids)
