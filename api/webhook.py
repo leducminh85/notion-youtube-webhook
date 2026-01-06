@@ -411,61 +411,42 @@ def insert_video_batch(
 # -------------------------
 # Route
 # -------------------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
+@app.route("/get-channel-detail", methods=["POST"])
+def get_channel_detail():
     payload = request.get_json(silent=True)
     if not payload:
         return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
-    logger.debug("/webhook received payload keys: %s", list(payload.keys()) if isinstance(payload, dict) else str(type(payload)))
 
     try:
         yt_api_key = os.environ.get("YOUTUBE_API_KEY")
         notion_api_key = os.environ.get("NOTION_API_KEY")
-        logger.debug("env presence - YT: %s, NOTION: %s", bool(yt_api_key), bool(notion_api_key))
         if not yt_api_key or not notion_api_key:
-            logger.error("Missing required environment variables YOUTUBE_API_KEY or NOTION_API_KEY")
             raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
 
         data = payload.get("data", {})
         props = data.get("properties", {})
 
-        # (A) Lấy channel_url như code đang chạy
         channel_url = get_property_value(props, "Channel URL")
-        logger.debug("Channel URL property value: %s", channel_url)
         if not channel_url:
-            logger.error("Missing property: Channel URL in properties: %s", list(props.keys()))
             raise ValueError("Missing property: Channel URL")
 
-        # (B) Lấy database_id & page_tong_id như code đang chạy
-        parent = data.get("parent", {})
-        triggering_db_id = parent.get("database_id")
-        logger.debug("Triggering DB id from payload parent: %s", triggering_db_id)
+        triggering_db_id = data.get("parent", {}).get("database_id")
         if not triggering_db_id:
-            logger.error("Missing data.parent.database_id (trigger must be a database row); parent: %s", parent)
-            raise ValueError("Missing data.parent.database_id (trigger must be a database row)")
+            raise ValueError("Missing data.parent.database_id")
 
         page_tong_id = get_page_tong_id_from_database(notion_api_key, triggering_db_id)
-
-        # (C) NEW: page_id của row hiện tại để update stats vào database Channels
         page_id = data.get("id")
-        logger.debug("Page id from payload: %s", page_id)
         if not page_id:
-            logger.error("Missing data.id (page id of the row) in data: %s", data)
             raise ValueError("Missing data.id (page id of the row)")
 
-        # YouTube: channel stats + frequency
-        logger.info("Resolving channel id for url=%s", channel_url)
+        # --- YouTube data ---
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
-        logger.info("Resolved channel_id=%s", channel_id)
         stats = youtube_get_channel_stats(yt_api_key, channel_id)
-        logger.info("Channel stats fetched: subs=%s, videos=%s, views=%s", stats.get("subscriberCount"), stats.get("videoCount"), stats.get("viewCount"))
         freq = get_upload_frequency(yt_api_key, channel_id)
-        logger.info("Upload frequency: %s", freq)
+        channel_title = stats["title"]
 
-        # (D) NEW: update row hiện tại theo schema thật của database Channels
+        # --- Update channel row stats ---
         schema = notion_get_database_schema(notion_api_key, triggering_db_id)
-
-        # Tên cột output của bạn
         OUT_TITLE = "Tên kênh"
         OUT_SUBS = "Subcriber"
         OUT_VIDEOS = "Số video"
@@ -473,14 +454,10 @@ def webhook():
         OUT_FREQ = "Chu kì đăng video"
 
         update_props = {}
-
-        # Text fields: title or rich_text
         if OUT_TITLE in schema and schema[OUT_TITLE] in ("title", "rich_text"):
-            update_props[OUT_TITLE] = notion_prop_text(stats["title"], schema[OUT_TITLE])
+            update_props[OUT_TITLE] = notion_prop_text(channel_title, schema[OUT_TITLE])
         if OUT_FREQ in schema and schema[OUT_FREQ] in ("title", "rich_text"):
             update_props[OUT_FREQ] = notion_prop_text(freq, schema[OUT_FREQ])
-
-        # Number fields
         if OUT_SUBS in schema and schema[OUT_SUBS] == "number":
             update_props[OUT_SUBS] = {"number": stats["subscriberCount"]}
         if OUT_VIDEOS in schema and schema[OUT_VIDEOS] == "number":
@@ -488,54 +465,101 @@ def webhook():
         if OUT_VIEWS in schema and schema[OUT_VIEWS] == "number":
             update_props[OUT_VIEWS] = {"number": stats["viewCount"]}
 
-        # chỉ update nếu có cột khớp schema
         if update_props:
-            logger.info("Updating notion page %s with props: %s", page_id, update_props)
             notion_update_page_properties(notion_api_key, page_id, update_props)
 
-        # (E) Phần tạo DB video như code đang chạy
-        channel_title = stats["title"]
+        # --- Video database handling ---
         uploads_id = youtube_uploads_playlist_id(yt_api_key, channel_id)
-        
-        # Cập nhật: Giới hạn số video để tránh timeout, ví dụ 200 video mới nhất
-        # VIDEO_LIMIT = 200  # Bạn có thể thay đổi giá trị này
-        items = youtube_playlist_videos_basic(yt_api_key, uploads_id)
-        logger.info("Fetched %s playlist items for uploads playlist %s", len(items), uploads_id)
+        VIDEO_LIMIT = 200  # Giới hạn để tránh timeout
+        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=VIDEO_LIMIT)
 
-        video_ids = []
-        for it in items:
-            vid = it.get("snippet", {}).get("resourceId", {}).get("videoId")
-            if vid:
-                video_ids.append(vid)
-
+        video_ids = [it["snippet"]["resourceId"]["videoId"] for it in items if it.get("snippet", {}).get("resourceId", {}).get("videoId")]
         views_map = youtube_get_view_counts(yt_api_key, video_ids)
 
-        # Kiểm tra xem database video đã tồn tại chưa (để tránh tạo trùng)
+        # Tìm database video hiện có (hỗ trợ cả title format cũ và mới)
         existing_db_id = None
         r = requests.get(
             f"https://api.notion.com/v1/blocks/{page_tong_id}/children",
             headers=notion_headers(notion_api_key),
-            params={"page_size": 100}  # Giả sử không quá 100 children
+            params={"page_size": 100}
         )
         if r.status_code >= 300:
-            logger.error("List children failed for page_tong_id=%s: %s %s", page_tong_id, r.status_code, r.text)
             raise ValueError(f"List children failed: {r.status_code} {r.text}")
-        
+
         children = r.json().get("results", [])
         for child in children:
-            if child.get("type") == "database" and child.get("database", {}).get("title", [{}])[0].get("text", {}).get("content") == channel_title:
-                existing_db_id = child["id"]
-                break
+            if child.get("type") == "child_database":
+                title_parts = child.get("child_database", {}).get("title", [])
+                db_title = ""
+                for part in title_parts:
+                    if isinstance(part, dict):
+                        db_title += part.get("text", {}).get("content", "") or part.get("plain_text", "")
+                    elif isinstance(part, str):
+                        db_title += part
+                if db_title.strip() == channel_title.strip():
+                    existing_db_id = child["id"]
+                    break
 
-        if existing_db_id:
-            new_db_id = existing_db_id
-            logger.info("Using existing videos database %s for channel %s", new_db_id, channel_title)
-            # Có thể thêm logic để check và chỉ insert video mới, nhưng tạm skip để đơn giản
+        if not existing_db_id:
+            # Chưa có → tạo mới
+            db_id = notion_create_database_under_page(notion_api_key, page_tong_id, channel_title)
+            logger.info("Created new video database %s", db_id)
+            should_clear_old = False
         else:
-            new_db_id = notion_create_database_under_page(notion_api_key, page_tong_id, channel_title)
-            logger.info("Created new videos database %s for channel %s", new_db_id, channel_title)
+            # Đã có → dùng lại và sẽ clear toàn bộ rows cũ
+            db_id = existing_db_id
+            logger.info("Found existing video database %s → will refresh all videos", db_id)
+            should_clear_old = True
 
-        # Chuẩn bị data cho batch insert
+        # Nếu database đã tồn tại → xóa toàn bộ rows cũ trước khi insert mới
+        if should_clear_old:
+            logger.info("Archiving (deleting) all existing rows in video database %s", db_id)
+            has_more = True
+            next_cursor = None
+            pages_to_archive = []
+
+            while has_more:
+                query_payload = {"page_size": 100}
+                if next_cursor:
+                    query_payload["start_cursor"] = next_cursor
+
+                r = requests.post(
+                    f"https://api.notion.com/v1/databases/{db_id}/query",
+                    headers=notion_headers(notion_api_key),
+                    json=query_payload
+                )
+                if r.status_code >= 300:
+                    logger.warning("Query failed during archive, skipping clear: %s %s", r.status_code, r.text)
+                    should_clear_old = False
+                    break
+
+                res = r.json()
+                for page in res.get("results", []):
+                    if not page.get("archived", False):  # Chỉ lấy những row chưa bị archive
+                        pages_to_archive.append(page["id"])
+
+                has_more = res.get("has_more", False)
+                next_cursor = res.get("next_cursor")
+
+            # Archive parallel (nhanh và đúng cách)
+            if pages_to_archive:
+                def archive_page(page_id_archive):
+                    r_patch = requests.patch(
+                        f"https://api.notion.com/v1/pages/{page_id_archive}",
+                        headers=notion_headers(notion_api_key),
+                        json={"archived": True}
+                    )
+                    if r_patch.status_code >= 300:
+                        logger.warning("Failed to archive page %s: %s %s", page_id_archive, r_patch.status_code, r_patch.text)
+
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    executor.map(archive_page, pages_to_archive)
+
+                logger.info("Successfully archived %s old video rows", len(pages_to_archive))
+            else:
+                logger.info("No old rows to archive")
+
+        # --- Chuẩn bị và insert video mới ---
         videos_data = []
         for it in items:
             sn = it.get("snippet", {})
@@ -543,16 +567,11 @@ def webhook():
             published = sn.get("publishedAt")
             description = sn.get("description", "")
             vid = sn.get("resourceId", {}).get("videoId")
-
             if not vid or not published:
                 continue
 
             thumbs = sn.get("thumbnails", {})
-            thumb_url = (
-                thumbs.get("high", {}).get("url")
-                or thumbs.get("medium", {}).get("url")
-                or thumbs.get("default", {}).get("url")
-            )
+            thumb_url = thumbs.get("high", {}).get("url") or thumbs.get("medium", {}).get("url") or thumbs.get("default", {}).get("url")
 
             videos_data.append({
                 "title": title,
@@ -563,29 +582,28 @@ def webhook():
                 "thumbnail_url": thumb_url
             })
 
-        # Insert batch với parallel
-        logger.info("Inserting %s videos into Notion database %s", len(videos_data), new_db_id)
-        insert_video_batch(notion_api_key, new_db_id, videos_data)
+        if videos_data:
+            logger.info("Inserting %s videos (full refresh) into database %s", len(videos_data), db_id)
+            insert_video_batch(notion_api_key, db_id, videos_data, max_workers=8)
+        else:
+            logger.info("No videos to insert")
 
         return jsonify({
             "status": "success",
-            "message": "Updated channel row + created/used channel videos database",
+            "message": "Channel stats updated + video database refreshed completely",
             "page_id": page_id,
-            "triggering_db_id": triggering_db_id,
-            "page_tong_id": page_tong_id,
             "channel_id": channel_id,
             "channel_title": channel_title,
             "subscriber": stats["subscriberCount"],
             "video_count_channel": stats["videoCount"],
             "total_views_channel": stats["viewCount"],
             "upload_frequency": freq,
-            "new_database_id": new_db_id,
-            "video_count_inserted": len(items)
+            "video_database_id": db_id,
+            "videos_refreshed": len(videos_data)
         }), 200
 
     except Exception as e:
-        logger.exception("/webhook failed for payload; error: %s", e)
-        # trả lỗi rõ để debug nhanh
+        logger.exception("/get-channel-detail failed: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 def notion_retrieve_page(notion_api_key: str, page_id: str) -> dict:
@@ -625,7 +643,7 @@ def notion_prop_text(value: str, prop_type: str) -> dict:
         return {"title": [{"type": "text", "text": {"content": value}}]} if value else {"title": []}
     return {"rich_text": [{"type": "text", "text": {"content": value}}]} if value else {"rich_text": []}
 
-@app.route("/update", methods=["POST"])
+@app.route("/update-channel-info", methods=["POST"])
 def update_channel_only():
     payload = request.get_json(silent=True)
     if not payload:
@@ -722,7 +740,6 @@ def update_channel_only():
     except Exception as e:
         logger.exception("/update failed for page %s: %s", payload.get("page_id") or payload.get("data", {}).get("id"), e)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 
 # if __name__ == "__main__":
