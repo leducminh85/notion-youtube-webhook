@@ -1012,6 +1012,186 @@ def vidiq_get_30_day_views(channel_id: str) -> int:
     except Exception as e:
         logger.exception(f"Lỗi khi tính toán view VidIQ cho {channel_id}: {e}")
         return 0
+    
+
+# -------------------------
+# VidIQ Helpers (Updated)
+# -------------------------
+def vidiq_fetch_data(channel_id: str):
+    """
+    Gọi VidIQ API, trả về tuple: (views_30_days, daily_stats_list)
+    """
+    vidiq_token = os.environ.get("VIDIQ_BEARER_TOKEN")
+    url = f"https://api.vidiq.com/youtube/channels/public/channel-pages/{channel_id}"
+    
+    headers = {
+        "accept": "*/*",
+        "accept-language": "vi,en;q=0.9,vi-VN;q=0.8",
+        "authorization": f"Bearer {vidiq_token}",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "x-vidiq-client": "ext vch/3.168.0"
+    }
+
+    try:
+        r = cffi_requests.get(url, headers=headers, impersonate="chrome110", timeout=30)
+        if r.status_code >= 300:
+            logger.error(f"VidIQ API Error: {r.status_code} {r.text[:200]}")
+            return 0, []
+
+        data = r.json()
+        daily_stats = data.get("daily_stats", [])
+
+        # --- Tính toán 30-day views ---
+        current_stats = data.get("current_stats", {}).get("views", {})
+        if not daily_stats or len(daily_stats) < 2:
+            return 0, []
+
+        current_total_views = current_stats.get("count", 0)
+        yesterday_total_views = daily_stats[1].get("views", 0)
+        
+        views_today_realtime = max(0, current_total_views - yesterday_total_views)
+        past_days_stats = daily_stats[1:30] 
+        views_past_29_days = sum(day.get("views_change", 0) for day in past_days_stats)
+        
+        total_30_days = views_today_realtime + views_past_29_days
+        
+        return total_30_days, daily_stats
+
+    except Exception as e:
+        logger.exception(f"Lỗi khi fetch VidIQ cho {channel_id}: {e}")
+        return 0, []
+
+# -------------------------
+# Daily Stats Database Helpers (Fixed)
+# -------------------------
+def ensure_daily_stats_database(notion_api_key: str, parent_page_id: str) -> str:
+    """
+    Kiểm tra xem page con 'Daily Stats' đã có chưa. Nếu chưa thì tạo mới.
+    Trả về database_id.
+    """
+    # 1. Tìm xem đã có database con tên "Daily Stats" chưa
+    r = requests.get(
+        f"https://api.notion.com/v1/blocks/{parent_page_id}/children",
+        headers=notion_headers(notion_api_key),
+        params={"page_size": 100}
+    )
+    if r.status_code == 200:
+        results = r.json().get("results", [])
+        for block in results:
+            if block.get("type") == "child_database":
+                title = block.get("child_database", {}).get("title", "")
+                if title == "Daily Stats":
+                    return block["id"]
+    
+    # 2. Nếu chưa có, tạo mới
+    # FIX: Cột "Date" phải là "title" vì Notion bắt buộc mỗi DB phải có 1 cột Title.
+    payload = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": "Daily Stats"}}],
+        "properties": {
+            "Date": {"title": {}},  # <-- QUAN TRỌNG: Đây là cột Title bắt buộc
+            "Views": {"number": {"format": "number"}},
+            "Views Change": {"number": {"format": "number"}},
+            "Subscribers": {"number": {"format": "number"}},
+            "Subscribers Change": {"number": {"format": "number"}}
+        }
+    }
+    r = requests.post(
+        "https://api.notion.com/v1/databases",
+        headers=notion_headers(notion_api_key),
+        json=payload
+    )
+    if r.status_code >= 300:
+        logger.error(f"Create DB Error: {r.text}")
+        raise ValueError(f"Không thể tạo Daily Stats DB: {r.text}")
+    
+    return r.json()["id"]
+
+def sync_daily_stats_rows(notion_api_key: str, db_id: str, daily_stats: List[dict]):
+    """
+    Sync dữ liệu daily_stats vào Notion. Chỉ insert những ngày chưa có.
+    """
+    # 1. Lấy danh sách ngày đã tồn tại trong DB để tránh trùng lặp
+    existing_dates = set()
+    has_more = True
+    next_cursor = None
+    
+    while has_more:
+        query_payload = {"page_size": 100, "properties": ["Date"]} 
+        if next_cursor:
+            query_payload["start_cursor"] = next_cursor
+            
+        r = requests.post(
+            f"https://api.notion.com/v1/databases/{db_id}/query",
+            headers=notion_headers(notion_api_key),
+            json=query_payload
+        )
+        if r.status_code != 200:
+            logger.error(f"Query Daily DB Error: {r.text}")
+            break
+            
+        res = r.json()
+        for page in res.get("results", []):
+            # FIX: Đọc dữ liệu từ cột Title (Date)
+            props = page.get("properties", {})
+            date_prop = props.get("Date", {})
+            
+            # Cột Title trả về mảng rich text
+            title_parts = date_prop.get("title", [])
+            if title_parts:
+                content = "".join([t.get("text", {}).get("content", "") for t in title_parts])
+                if content:
+                    existing_dates.add(content.strip()) # Format YYYY-MM-DD
+        
+        has_more = res.get("has_more", False)
+        next_cursor = res.get("next_cursor")
+
+    # 2. Lọc ra các item cần insert
+    to_insert = []
+    for stat in daily_stats:
+        ts = stat.get("date")
+        if not ts: continue
+        
+        # Convert timestamp sang YYYY-MM-DD
+        dt_str = datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
+        
+        if dt_str not in existing_dates:
+            to_insert.append({
+                "date_str": dt_str,
+                "views": stat.get("views"),
+                "views_change": stat.get("views_change"),
+                "subs": stat.get("subscribers"),
+                "subs_change": stat.get("subscribers_change")
+            })
+
+    if not to_insert:
+        logger.info(f"Daily Stats: Không có dữ liệu mới cho DB {db_id}")
+        return 0
+
+    # 3. Insert song song
+    def insert_row(item):
+        # FIX: Payload cho cột Title khác với cột Date thường
+        props = {
+            "Date": {"title": [{"text": {"content": item["date_str"]}}]}, 
+            "Views": {"number": item["views"]},
+            "Views Change": {"number": item["views_change"]},
+            "Subscribers": {"number": item["subs"]},
+            "Subscribers Change": {"number": item["subs_change"]},
+        }
+        r_ins = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=notion_headers(notion_api_key),
+            json={"parent": {"database_id": db_id}, "properties": props}
+        )
+        if r_ins.status_code >= 300:
+            logger.error(f"Insert Daily Row Error: {r_ins.text}")
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        executor.map(insert_row, to_insert)
+        
+    logger.info(f"Đã insert {len(to_insert)} dòng vào Daily Stats DB {db_id}")
+    return len(to_insert)
 # -------------------------
 # New Route
 # -------------------------
@@ -1028,7 +1208,6 @@ def get_channel_views_monthly():
         if not yt_api_key or not notion_api_key:
             raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
 
-        # Hỗ trợ payload webhook hoặc payload test thủ công
         data = payload.get("data", {})
         page_id = data.get("id") or payload.get("page_id")
         
@@ -1036,7 +1215,7 @@ def get_channel_views_monthly():
             raise ValueError("Missing page_id")
 
         # 1. Lấy thông tin Page Notion để tìm Channel URL
-        logger.info(f"Retrieving Notion page {page_id} for monthly views")
+        logger.info(f"Retrieving Notion page {page_id}")
         page = notion_retrieve_page(notion_api_key, page_id)
         props = page.get("properties", {})
 
@@ -1044,17 +1223,17 @@ def get_channel_views_monthly():
         if not channel_url:
             raise ValueError("Missing property: Channel URL")
 
-        # 2. Chuyển đổi URL sang Channel ID (dùng Youtube API helper có sẵn)
+        # 2. Chuyển đổi URL sang Channel ID
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
         
-        # 3. Gọi VidIQ để lấy số view 30 ngày
-        views_30_days = vidiq_get_30_day_views(channel_id)
+        # 3. Gọi VidIQ để lấy dữ liệu (Views 30 ngày + Daily Stats)
+        views_30_days, daily_stats_list = vidiq_fetch_data(channel_id)
 
-        # 4. Cập nhật lại vào Notion (Nếu có cột tương ứng)
+        # 4. Cập nhật cột "Views (30 ngày)" vào Row chính (Page Kênh)
         triggering_db_id = page.get("parent", {}).get("database_id")
         if triggering_db_id:
             schema = notion_get_database_schema(notion_api_key, triggering_db_id)
-            OUT_VIEWS_MONTHLY = "Views (30 ngày)" # Tên cột trong Notion phải chính xác
+            OUT_VIEWS_MONTHLY = "Views (30 ngày)"
             
             update_props = {}
             if OUT_VIEWS_MONTHLY in schema and schema[OUT_VIEWS_MONTHLY] == "number":
@@ -1062,21 +1241,27 @@ def get_channel_views_monthly():
             
             if update_props:
                 notion_update_page_properties(notion_api_key, page_id, update_props)
-                logger.info(f"Updated page {page_id} with 30-day views: {views_30_days}")
-            else:
-                logger.warning(f"Column '{OUT_VIEWS_MONTHLY}' not found in Notion database or not a Number type.")
+
+        # 5. Xử lý Daily Stats Database
+        inserted_count = 0
+        if daily_stats_list:
+            # Tạo hoặc lấy ID database con "Daily Stats"
+            daily_db_id = ensure_daily_stats_database(notion_api_key, page_id)
+            
+            # Sync dữ liệu
+            inserted_count = sync_daily_stats_rows(notion_api_key, daily_db_id, daily_stats_list)
 
         return jsonify({
             "status": "success",
             "page_id": page_id,
             "channel_id": channel_id,
-            "views_30_days": views_30_days
+            "views_30_days": views_30_days,
+            "daily_stats_inserted": inserted_count
         }), 200
 
     except Exception as e:
         logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
-    
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 5000))
 #     app.run(host="0.0.0.0", port=port)
