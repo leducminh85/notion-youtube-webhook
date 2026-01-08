@@ -19,8 +19,8 @@ from .helpers.notion import (
     notion_retrieve_page,
     notion_prop_text,
     get_page_tong_id_from_database,
-    ensure_daily_stats_database,
-    sync_daily_stats_rows,
+    ensure_combined_daily_stats_database,
+    sync_combined_daily_stats_rows,
 )
 from .helpers.vidiq import vidiq_fetch_data
 from .utils import get_property_value
@@ -336,8 +336,7 @@ def update_channel_detail():
             notion_update_page_properties(notion_api_key, page_id, update_props)
 
         uploads_id = youtube_uploads_playlist_id(yt_api_key, channel_id)
-        VIDEO_LIMIT = 200
-        items = youtube_playlist_videos_basic(yt_api_key, uploads_id, limit=VIDEO_LIMIT)
+        items = youtube_playlist_videos_basic(yt_api_key, uploads_id)
 
         video_ids = [it["snippet"]["resourceId"]["videoId"] for it in items if it.get("snippet", {}).get("resourceId", {}).get("videoId")]
         views_map = youtube_get_view_counts(yt_api_key, video_ids)
@@ -457,8 +456,9 @@ def get_channel_views_monthly():
     try:
         yt_api_key = os.environ.get("YOUTUBE_API_KEY")
         notion_api_key = os.environ.get("NOTION_API_KEY")
-        if not yt_api_key or not notion_api_key:
-            raise ValueError("Missing env: YOUTUBE_API_KEY or NOTION_API_KEY")
+        vidiq_token = os.environ.get("VIDIQ_BEARER_TOKEN")
+        if not yt_api_key or not notion_api_key or not vidiq_token:
+            raise ValueError("Missing env: YOUTUBE_API_KEY, NOTION_API_KEY or VIDIQ_BEARER_TOKEN")
 
         data = payload.get("data", {})
         page_id = data.get("id") or payload.get("page_id")
@@ -472,8 +472,11 @@ def get_channel_views_monthly():
             raise ValueError("Missing property: Channel URL")
 
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+        channel_stats = youtube_get_channel_stats(yt_api_key, channel_id)
+        channel_title = channel_stats.get("title", "Unknown Channel")
         views_30_days, daily_stats_list = vidiq_fetch_data(channel_id)
 
+        # === Cập nhật Views (30 ngày) trên page channel ===
         triggering_db_id = page.get("parent", {}).get("database_id")
         if triggering_db_id:
             schema = notion_get_database_schema(notion_api_key, triggering_db_id)
@@ -484,23 +487,29 @@ def get_channel_views_monthly():
             if update_props:
                 notion_update_page_properties(notion_api_key, page_id, update_props)
 
+        # === Đồng bộ vào Combined Daily Stats ở parent page ===
         inserted_count = 0
         if daily_stats_list:
-            daily_db_id = ensure_daily_stats_database(notion_api_key, page_id)
-            inserted_count = sync_daily_stats_rows(notion_api_key, daily_db_id, daily_stats_list)
+            # Lấy parent page của database chứa các channel
+            parent_page_id = get_page_tong_id_from_database(notion_api_key, triggering_db_id)
+            combined_db_id = ensure_combined_daily_stats_database(notion_api_key, parent_page_id)
+            inserted_count = sync_combined_daily_stats_rows(
+                notion_api_key, combined_db_id, channel_title, daily_stats_list
+            )
 
         return jsonify({
             "status": "success",
             "page_id": page_id,
             "channel_id": channel_id,
+            "channel_name": channel_title,
             "views_30_days": views_30_days,
-            "daily_stats_inserted": inserted_count
+            "combined_daily_inserted": inserted_count
         }), 200
 
     except Exception as e:
         logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
-
+    
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

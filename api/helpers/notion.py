@@ -309,3 +309,149 @@ def sync_daily_stats_rows(notion_api_key: str, db_id: str, daily_stats: List[dic
 	logger.info(f"Đã insert {len(to_insert)} dòng vào Daily Stats DB {db_id}")
 	return len(to_insert)
 
+# Thêm vào cuối file notion.py
+
+def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: str) -> str:
+    """
+    Tìm hoặc tạo database "Combined Daily Stats" dưới parent_page_id
+    """
+    r = requests.get(
+        f"https://api.notion.com/v1/blocks/{parent_page_id}/children",
+        headers=notion_headers(notion_api_key),
+        params={"page_size": 100}
+    )
+    if r.status_code == 200:
+        results = r.json().get("results", [])
+        for block in results:
+            if block.get("type") == "child_database":
+                # Lấy title an toàn hơn: hỗ trợ cả list dict và list string
+                title_parts = block.get("child_database", {}).get("title", [])
+                title = ""
+                for part in title_parts:
+                    if isinstance(part, dict):
+                        title += part.get("plain_text", "") or part.get("text", {}).get("content", "")
+                    elif isinstance(part, str):
+                        title += part
+                if title.strip() == "Combined Daily Stats":
+                    return block["id"]
+
+    # Nếu chưa có thì tạo mới
+    payload = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": "Combined Daily Stats"}}],
+        "properties": {
+            "Channel": {"title": {}},
+            "Date": {"date": {}},
+            "Subscribers": {"number": {"format": "number"}},
+            "Total Views": {"number": {"format": "number"}},
+            "Views Change": {"number": {"format": "number"}},
+        }
+    }
+    r = requests.post(
+        "https://api.notion.com/v1/databases",
+        headers=notion_headers(notion_api_key),
+        json=payload
+    )
+    if r.status_code >= 300:
+        logger.error(f"Create Combined Daily Stats DB Error: {r.text}")
+        raise ValueError(f"Không thể tạo Combined Daily Stats DB: {r.text}")
+
+    logger.info("Đã tạo mới Combined Daily Stats database")
+    return r.json()["id"]
+
+
+def sync_combined_daily_stats_rows(
+    notion_api_key: str,
+    db_id: str,
+    channel_name: str,
+    daily_stats: List[dict]
+):
+    """
+    Đồng bộ daily stats của một channel vào combined database.
+    Chỉ insert những ngày chưa có cho channel đó.
+    """
+    existing_keys = set()
+    has_more = True
+    next_cursor = None
+
+    while has_more:
+        query_payload = {"page_size": 100}
+        if next_cursor:
+            query_payload["start_cursor"] = next_cursor
+
+        r = requests.post(
+            f"https://api.notion.com/v1/databases/{db_id}/query",
+            headers=notion_headers(notion_api_key),
+            json=query_payload
+        )
+        if r.status_code != 200:
+            logger.error(f"Query Combined Daily DB Error: {r.text}")
+            break
+
+        res = r.json()
+        for page in res.get("results", []):
+            props = page.get("properties", {})
+            channel_prop = props.get("Channel", {}).get("title", [])
+            date_prop = props.get("Date", {}).get("date", {})
+
+            channel_text = ""
+            for t in channel_prop:
+                if isinstance(t, dict):
+                    channel_text += t.get("plain_text", "") or t.get("text", {}).get("content", "")
+                elif isinstance(t, str):
+                    channel_text += t
+            channel_text = channel_text.strip()
+
+            date_start = date_prop.get("start", "") if date_prop else ""
+
+            if channel_text and date_start:
+                existing_keys.add((channel_text.strip(), date_start[:10]))  # YYYY-MM-DD
+
+        has_more = res.get("has_more", False)
+        next_cursor = res.get("next_cursor")
+
+    to_insert = []
+    for stat in daily_stats:
+        ts = stat.get("date")
+        if not ts:
+            continue
+        dt_str = __import__("datetime").datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
+        key = (channel_name.strip(), dt_str)
+        if key not in existing_keys:
+            to_insert.append({
+                "channel": channel_name,
+                "date_str": dt_str,
+                "subscribers": stat.get("subscribers"),
+                "total_views": stat.get("views"),
+                "views_change": stat.get("views_change"),
+            })
+
+    if not to_insert:
+        logger.info(f"Combined Daily Stats: Không có dữ liệu mới cho channel {channel_name}")
+        return 0
+
+    def insert_row(item: dict):
+        props = {
+            "Channel": {"title": [{"text": {"content": item["channel"]}}]},
+            "Date": {"date": {"start": item["date_str"]}},
+            "Subscribers": {"number": item["subscribers"]},
+            "Total Views": {"number": item["total_views"]},
+            "Views Change": {"number": item["views_change"]},
+        }
+        r_ins = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=notion_headers(notion_api_key),
+            json={
+                "parent": {"database_id": db_id},
+                "properties": props
+            }
+        )
+        if r_ins.status_code >= 300:
+            logger.error(f"Insert Combined Row Error: {r_ins.text}")
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        executor.map(insert_row, to_insert)
+
+    logger.info(f"Đã insert {len(to_insert)} dòng mới cho {channel_name} vào Combined Daily Stats")
+    return len(to_insert)
