@@ -365,17 +365,29 @@ def sync_combined_daily_stats_rows(
     db_id: str,
     channel_name: str,
     daily_stats: List[dict]
-):
+) -> int:
     """
-    Đồng bộ daily stats của một channel vào combined database.
-    Chỉ insert những ngày chưa có cho channel đó.
+    Cập nhật daily stats cho một channel vào Combined Daily Stats:
+    - Xóa hết các row cũ của channel đó trước.
+    - Chỉ insert 30 ngày gần nhất từ dữ liệu mới.
     """
-    existing_keys = set()
+    channel_name = channel_name.strip()
+
+    # === Bước 1: Xóa tất cả các row cũ của channel này ===
     has_more = True
     next_cursor = None
+    deleted_count = 0
 
     while has_more:
-        query_payload = {"page_size": 100}
+        query_payload = {
+            "page_size": 100,
+            "filter": {
+                "property": "Channel",
+                "title": {
+                    "equals": channel_name
+                }
+            }
+        }
         if next_cursor:
             query_payload["start_cursor"] = next_cursor
 
@@ -385,66 +397,75 @@ def sync_combined_daily_stats_rows(
             json=query_payload
         )
         if r.status_code != 200:
-            logger.error(f"Query Combined Daily DB Error: {r.text}")
+            logger.error(f"Query to delete old rows failed: {r.text}")
             break
 
         res = r.json()
-        for page in res.get("results", []):
-            props = page.get("properties", {})
-            channel_prop = props.get("Channel", {}).get("title", [])
-            date_prop = props.get("Date", {}).get("date", {})
+        pages = res.get("results", [])
 
-            channel_text = ""
-            for t in channel_prop:
-                if isinstance(t, dict):
-                    channel_text += t.get("plain_text", "") or t.get("text", {}).get("content", "")
-                elif isinstance(t, str):
-                    channel_text += t
-            channel_text = channel_text.strip()
-
-            date_start = date_prop.get("start", "") if date_prop else ""
-
-            if channel_text and date_start:
-                existing_keys.add((channel_text.strip(), date_start[:10]))  # YYYY-MM-DD
+        # Xóa từng page (Notion không hỗ trợ bulk delete, phải xóa từng cái)
+        for page in pages:
+            page_id = page["id"]
+            # Archive (soft delete) thay vì delete cứng để an toàn
+            archive_r = requests.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=notion_headers(notion_api_key),
+                json={"archived": True}
+            )
+            if archive_r.status_code == 200:
+                deleted_count += 1
+            else:
+                logger.warning(f"Failed to archive old row {page_id}: {archive_r.text}")
 
         has_more = res.get("has_more", False)
         next_cursor = res.get("next_cursor")
 
+    logger.info(f"Đã xóa/archived {deleted_count} dòng cũ của channel '{channel_name}'")
+
+    # === Bước 2: Chỉ lấy 30 ngày gần nhất từ daily_stats ===
+    if not daily_stats:
+        logger.info(f"Không có daily stats để insert cho {channel_name}")
+        return 0
+
+    # Sắp xếp theo date giảm dần (mới nhất trước)
+    sorted_stats = sorted(daily_stats, key=lambda x: x.get("date", 0), reverse=True)
+    recent_30_days = sorted_stats[:30]
+
+    if len(recent_30_days) < len(sorted_stats):
+        logger.info(f"Chỉ lấy 30 ngày gần nhất (bỏ qua {len(sorted_stats) - 30} ngày cũ hơn)")
+
+    # === Bước 3: Insert dữ liệu mới ===
     to_insert = []
-    for stat in daily_stats:
+    for stat in recent_30_days:
         ts = stat.get("date")
         if not ts:
             continue
         dt_str = __import__("datetime").datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
-        key = (channel_name.strip(), dt_str)
-        if key not in existing_keys:
-            to_insert.append({
-                "channel": channel_name,
-                "date_str": dt_str,
-                "subscribers": stat.get("subscribers"),
-                "total_views": stat.get("views"),
-                "views_change": stat.get("views_change"),
-            })
+
+        to_insert.append({
+            "channel": channel_name,
+            "date_str": dt_str,
+            "subscribers": stat.get("subscribers"),
+            "total_views": stat.get("views"),
+            "views_change": stat.get("views_change"),
+        })
 
     if not to_insert:
-        logger.info(f"Combined Daily Stats: Không có dữ liệu mới cho channel {channel_name}")
+        logger.info(f"Không có dữ liệu hợp lệ để insert cho {channel_name}")
         return 0
 
     def insert_row(item: dict):
         props = {
             "Channel": {"title": [{"text": {"content": item["channel"]}}]},
             "Date": {"date": {"start": item["date_str"]}},
-            "Subscribers": {"number": item["subscribers"]},
-            "Total Views": {"number": item["total_views"]},
-            "Views Change": {"number": item["views_change"]},
+            "Subscribers": {"number": item["subscribers"] if item["subscribers"] is not None else None},
+            "Total Views": {"number": item["total_views"] if item["total_views"] is not None else None},
+            "Views Change": {"number": item["views_change"] if item["views_change"] is not None else None},
         }
         r_ins = requests.post(
             "https://api.notion.com/v1/pages",
             headers=notion_headers(notion_api_key),
-            json={
-                "parent": {"database_id": db_id},
-                "properties": props
-            }
+            json={"parent": {"database_id": db_id}, "properties": props}
         )
         if r_ins.status_code >= 300:
             logger.error(f"Insert Combined Row Error: {r_ins.text}")
@@ -453,5 +474,5 @@ def sync_combined_daily_stats_rows(
     with ThreadPoolExecutor(max_workers=5) as executor:
         executor.map(insert_row, to_insert)
 
-    logger.info(f"Đã insert {len(to_insert)} dòng mới cho {channel_name} vào Combined Daily Stats")
+    logger.info(f"Đã insert {len(to_insert)} dòng (30 ngày gần nhất) cho {channel_name}")
     return len(to_insert)
