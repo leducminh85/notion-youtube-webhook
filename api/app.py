@@ -11,6 +11,8 @@ from .helpers.youtube import (
     get_upload_frequency,
 )
 from .helpers.notion import (
+    calculate_monthly_views_gained,
+    ensure_combined_monthly_stats_database,
     notion_headers,
     notion_get_database_schema,
     notion_update_page_properties,
@@ -21,6 +23,7 @@ from .helpers.notion import (
     get_page_tong_id_from_database,
     ensure_combined_daily_stats_database,
     sync_combined_daily_stats_rows,
+    sync_combined_monthly_stats_rows,
 )
 from .helpers.vidiq import vidiq_fetch_data
 from .utils import get_property_value
@@ -474,7 +477,7 @@ def get_channel_views_monthly():
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
         channel_stats = youtube_get_channel_stats(yt_api_key, channel_id)
         channel_title = channel_stats.get("title", "Unknown Channel")
-        views_30_days, daily_stats_list = vidiq_fetch_data(channel_id)
+        views_30_days, daily_stats_list, monthly_stats_list = vidiq_fetch_data(channel_id)  # Thêm monthly
 
         # === Cập nhật Views (30 ngày) trên page channel ===
         triggering_db_id = page.get("parent", {}).get("database_id")
@@ -487,14 +490,23 @@ def get_channel_views_monthly():
             if update_props:
                 notion_update_page_properties(notion_api_key, page_id, update_props)
 
-        # === Đồng bộ vào Combined Daily Stats ở parent page ===
-        inserted_count = 0
-        if daily_stats_list:
-            # Lấy parent page của database chứa các channel
+        # === Đồng bộ Daily và Monthly ===
+        inserted_daily = 0
+        inserted_monthly = 0
+
+        if daily_stats_list or monthly_stats_list:
             parent_page_id = get_page_tong_id_from_database(notion_api_key, triggering_db_id)
-            combined_db_id = ensure_combined_daily_stats_database(notion_api_key, parent_page_id)
-            inserted_count = sync_combined_daily_stats_rows(
-                notion_api_key, combined_db_id, channel_title, daily_stats_list
+
+            # Daily
+            combined_daily_db_id = ensure_combined_daily_stats_database(notion_api_key, parent_page_id)
+            inserted_daily = sync_combined_daily_stats_rows(
+                notion_api_key, combined_daily_db_id, channel_title, daily_stats_list
+            )
+
+            # Monthly
+            combined_monthly_db_id = ensure_combined_monthly_stats_database(notion_api_key, parent_page_id)
+            inserted_monthly = sync_combined_monthly_stats_rows(
+                notion_api_key, combined_monthly_db_id, channel_title, monthly_stats_list[:24]  # Limit 24 tháng
             )
 
         return jsonify({
@@ -503,13 +515,15 @@ def get_channel_views_monthly():
             "channel_id": channel_id,
             "channel_name": channel_title,
             "views_30_days": views_30_days,
-            "combined_daily_inserted": inserted_count
+            "monthly_stats_count": len(monthly_stats_list),
+            "combined_daily_inserted": inserted_daily,
+            "combined_monthly_inserted": inserted_monthly,
+            "latest_month_gained": monthly_stats_list[0]["views_gained"] if monthly_stats_list else None
         }), 200
 
     except Exception as e:
         logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
-    
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

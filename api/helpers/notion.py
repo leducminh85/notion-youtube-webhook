@@ -4,6 +4,9 @@ from typing import Dict, List, Optional
 import requests
 from ..config import NOTION_VERSION
 from ..utils import safe_json, get_property_value
+from datetime import datetime
+from collections import defaultdict
+
 
 logger = logging.getLogger(__name__)
 
@@ -476,3 +479,178 @@ def sync_combined_daily_stats_rows(
 
     logger.info(f"Đã insert {len(to_insert)} dòng (30 ngày gần nhất) cho {channel_name}")
     return len(to_insert)
+
+
+
+
+def calculate_monthly_views_gained(daily_stats: List[dict]) -> List[dict]:
+    """
+    Từ daily_stats của VidIQ, tính tổng views gained theo từng tháng.
+    Trả về list các dict: {month_str: '2025-01', views_gained: 1234567}
+    Chỉ lấy các tháng có dữ liệu đầy đủ (hoặc gần đầy).
+    """
+    if not daily_stats:
+        return []
+
+    # Sắp xếp daily_stats theo date tăng dần (cũ → mới)
+    sorted_stats = sorted(daily_stats, key=lambda x: x.get("date", 0))
+
+    monthly_gained = defaultdict(int)
+    monthly_total_views = {}  # để lưu total views cuối tháng
+
+    for stat in sorted_stats:
+        ts = stat.get("date")
+        if not ts:
+            continue
+        dt = datetime.utcfromtimestamp(ts)
+        month_key = dt.strftime('%Y-%m')  # ví dụ: "2025-01"
+
+        views_change = stat.get("views_change", 0)
+        if views_change > 0:
+            monthly_gained[month_key] += views_change
+
+        # Cập nhật total views cuối cùng của tháng
+        monthly_total_views[month_key] = stat.get("views", 0)
+
+    # Chuyển sang list và sort theo tháng mới nhất trước
+    result = []
+    for month_key in sorted(monthly_gained.keys(), reverse=True):
+        result.append({
+            "month": month_key,                    # '2025-01'
+            "views_gained": monthly_gained[month_key],
+            "total_views_at_end": monthly_total_views.get(month_key, 0)
+        })
+
+    # Chỉ lấy 24 tháng gần nhất (đủ để biểu đồ đẹp mà không quá dài)
+    return result[:24]
+
+
+def ensure_combined_monthly_stats_database(notion_api_key: str, parent_page_id: str) -> str:
+    """
+    Tìm hoặc tạo database "Combined Monthly Stats" dưới parent_page_id
+    """
+    r = requests.get(
+        f"https://api.notion.com/v1/blocks/{parent_page_id}/children",
+        headers=notion_headers(notion_api_key),
+        params={"page_size": 100}
+    )
+    if r.status_code == 200:
+        results = r.json().get("results", [])
+        for block in results:
+            if block.get("type") == "child_database":
+                title_parts = block.get("child_database", {}).get("title", [])
+                title = "".join(
+                    part.get("plain_text", "") or part.get("text", {}).get("content", "") 
+                    if isinstance(part, dict) else part
+                    for part in title_parts
+                )
+                if title.strip() == "Combined Monthly Stats":
+                    return block["id"]
+
+    # Tạo mới nếu chưa có
+    payload = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": "Combined Monthly Stats"}}],
+        "properties": {
+            "Channel": {"title": {}},
+            "Month": {"date": {}},                    # dùng date để dễ sort và filter
+            "Views Gained": {"number": {"format": "number"}},
+            "Total Views": {"number": {"format": "number"}},
+        }
+    }
+    r = requests.post(
+        "https://api.notion.com/v1/databases",
+        headers=notion_headers(notion_api_key),
+        json=payload
+    )
+    if r.status_code >= 300:
+        logger.error(f"Create Combined Monthly Stats DB Error: {r.text}")
+        raise ValueError(f"Không thể tạo Combined Monthly Stats DB: {r.text}")
+
+    logger.info("Đã tạo mới Combined Monthly Stats database")
+    return r.json()["id"]
+
+
+def sync_combined_monthly_stats_rows(
+    notion_api_key: str,
+    db_id: str,
+    channel_name: str,
+    monthly_stats: List[dict]
+) -> int:
+    """
+    Đồng bộ monthly stats cho một kênh vào Combined Monthly Stats DB
+    - Xóa hết row cũ của channel đó
+    - Insert các tháng gần nhất (từ monthly_stats)
+    """
+    channel_name = channel_name.strip()
+
+    # === Xóa row cũ của channel ===
+    has_more = True
+    next_cursor = None
+    deleted_count = 0
+
+    while has_more:
+        query_payload = {
+            "page_size": 100,
+            "filter": {
+                "property": "Channel",
+                "title": {"equals": channel_name}
+            }
+        }
+        if next_cursor:
+            query_payload["start_cursor"] = next_cursor
+
+        r = requests.post(
+            f"https://api.notion.com/v1/databases/{db_id}/query",
+            headers=notion_headers(notion_api_key),
+            json=query_payload
+        )
+        if r.status_code != 200:
+            logger.error(f"Query monthly delete failed: {r.text}")
+            break
+
+        res = r.json()
+        for page in res.get("results", []):
+            page_id = page["id"]
+            archive_r = requests.patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                headers=notion_headers(notion_api_key),
+                json={"archived": True}
+            )
+            if archive_r.status_code == 200:
+                deleted_count += 1
+
+        has_more = res.get("has_more", False)
+        next_cursor = res.get("next_cursor")
+
+    logger.info(f"Đã xóa {deleted_count} dòng monthly cũ của '{channel_name}'")
+
+    # === Insert dữ liệu mới ===
+    if not monthly_stats:
+        return 0
+
+    def insert_row(item: dict):
+        # Month format: "2025-01" → dùng ngày đầu tháng làm date
+        year, month = item["month"].split("-")
+        date_start = f"{year}-{month}-01"
+
+        props = {
+            "Channel": {"title": [{"text": {"content": channel_name}}]},
+            "Month": {"date": {"start": date_start}},
+            "Views Gained": {"number": item["views_gained"]},
+            "Total Views": {"number": item["total_views_at_end"]},
+        }
+        r_ins = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=notion_headers(notion_api_key),
+            json={"parent": {"database_id": db_id}, "properties": props}
+        )
+        if r_ins.status_code >= 300:
+            logger.error(f"Insert Monthly Row Error: {r_ins.text}")
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        executor.map(insert_row, monthly_stats)
+
+    logger.info(f"Đã insert {len(monthly_stats)} dòng monthly cho '{channel_name}'")
+    return len(monthly_stats)
