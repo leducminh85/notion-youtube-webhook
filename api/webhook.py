@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-# from dotenv import load_dotenv  # dùng local thì mở, deploy vercel thì tắt
+from dotenv import load_dotenv  # dùng local thì mở, deploy vercel thì tắt
 import os
 import json
 import time
@@ -10,7 +10,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from curl_cffi import requests as cffi_requests  # Import thư viện giả lập trình duyệt
 
-# load_dotenv()
+load_dotenv()
 
 app = Flask(__name__)
 NOTION_VERSION = "2022-06-28"
@@ -1262,6 +1262,6 @@ def get_channel_views_monthly():
     except Exception as e:
         logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
-# if __name__ == "__main__":
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host="0.0.0.0", port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
