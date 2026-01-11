@@ -2,4 +2,3 @@ flask
 requests
 curl_cffi
 datetime
-collections
