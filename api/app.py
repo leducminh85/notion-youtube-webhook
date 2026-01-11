@@ -525,6 +525,6 @@ def get_channel_views_monthly():
         logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host="0.0.0.0", port=port)
