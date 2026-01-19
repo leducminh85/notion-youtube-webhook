@@ -4,25 +4,68 @@ import requests
 from ..utils import safe_json
 from datetime import datetime
 import logging
-
+import re
 logger = logging.getLogger(__name__)
+from urllib.parse import urlparse
 
 
-def youtube_channel_id_from_url(yt_api_key: str, channel_url: str) -> str:
-	if "/channel/" in channel_url:
-		return channel_url.split("/channel/")[1].split("?")[0].strip("/")
-	if "/@" in channel_url:
-		handle = channel_url.split("/@")[1].split("?")[0].strip("/")
-		r = requests.get(
-			"https://www.googleapis.com/youtube/v3/channels",
-			params={"forHandle": handle, "key": yt_api_key, "part": "id"}
-		)
-		jd = safe_json(r)
-		if not jd.get("items"):
-			logger.error("youtube_channel_id_from_url: channel not found by handle %s (resp: %s)", handle, jd)
-			raise ValueError("Channel not found by handle")
-		return jd["items"][0]["id"]
-	raise ValueError("Invalid channel URL format. Use /channel/UC... or /@handle")
+def youtube_channel_id_from_url(api_key: str, channel_url: str) -> str:
+    """
+    Supports:
+      - https://www.youtube.com/channel/UCxxxx...
+      - https://www.youtube.com/@handle
+      - https://www.youtube.com/@handle/videos (và các tab khác)
+    """
+    if not channel_url or not isinstance(channel_url, str):
+        raise ValueError("Invalid channel_url")
+
+    u = channel_url.strip()
+
+    # Thêm scheme nếu thiếu
+    if not re.match(r"^https?://", u, re.IGNORECASE):
+        u = "https://" + u
+
+    parsed = urlparse(u)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    # Normalize path
+    path = re.sub(r"/{2,}", "/", path).rstrip("/")
+
+    if "youtube.com" not in host:
+        raise ValueError(f"Not a YouTube URL: {channel_url}")
+
+    # 1. Dạng /channel/UC...
+    m = re.search(r"/channel/(UC[a-zA-Z0-9_-]{22})", path)
+    if m:
+        return m.group(1)
+
+    # 2. Dạng /@handle...
+    m = re.search(r"^/(@[^/]+)", path)
+    if m:
+        handle = m.group(1)  # bao gồm dấu @
+
+        # Cách hiện đại (từ 2024+): dùng channels.list + forHandle
+        url = "https://www.googleapis.com/youtube/v3/channels"
+        params = {
+            "part": "id",
+            "forHandle": handle,
+            "key": api_key,
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()  # tự raise nếu 4xx/5xx
+
+        data = r.json()
+        items = data.get("items", [])
+        if not items:
+            raise ValueError(f"Cannot resolve channel id from handle: {handle}")
+
+        return items[0]["id"]
+
+    raise ValueError(
+        "Unsupported YouTube channel URL format. "
+        "Supported: /channel/UC... or /@handle"
+	)
 
 
 def youtube_get_channel_title(yt_api_key: str, channel_id: str) -> str:
