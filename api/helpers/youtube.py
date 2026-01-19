@@ -12,19 +12,16 @@ from urllib.parse import urlparse
 def youtube_channel_id_from_url(api_key: str, channel_url: str) -> str:
     """
     Supports:
-      - https://www.youtube.com/channel/UCxxxx
-      - https://www.youtube.com/channel/UCxxxx/videos
+      - https://www.youtube.com/channel/UCxxxx...
       - https://www.youtube.com/@handle
-      - https://www.youtube.com/@handle/featured (or /videos, /shorts, /live, /about, ...)
-    Notes:
-      - /c/<name> and /user/<name> are NOT handled here (can be added later).
+      - https://www.youtube.com/@handle/videos (và các tab khác)
     """
     if not channel_url or not isinstance(channel_url, str):
         raise ValueError("Invalid channel_url")
 
     u = channel_url.strip()
 
-    # Ensure scheme
+    # Thêm scheme nếu thiếu
     if not re.match(r"^https?://", u, re.IGNORECASE):
         u = "https://" + u
 
@@ -32,50 +29,44 @@ def youtube_channel_id_from_url(api_key: str, channel_url: str) -> str:
     host = (parsed.netloc or "").lower()
     path = parsed.path or ""
 
-    # Normalize path: remove multiple slashes and trailing slash
+    # Normalize path
     path = re.sub(r"/{2,}", "/", path).rstrip("/")
 
-    # Quick check for youtube domains
-    if "youtube.com" not in host and "youtu.be" not in host:
+    if "youtube.com" not in host:
         raise ValueError(f"Not a YouTube URL: {channel_url}")
 
-    # 1) /channel/UCxxxx... (even if has extra segments after)
-    m = re.search(r"/channel/(UC[a-zA-Z0-9_-]+)", path)
+    # 1. Dạng /channel/UC...
+    m = re.search(r"/channel/(UC[a-zA-Z0-9_-]{22})", path)
     if m:
         return m.group(1)
 
-    # 2) /@handle[/...]
-    # Grab the first segment that starts with '@'
-    m = re.search(r"/(@[^/]+)", path)
+    # 2. Dạng /@handle...
+    m = re.search(r"^/(@[^/]+)", path)
     if m:
-        handle = m.group(1)  # like "@KIENTHUCQUANHTA247"
-        # Use YouTube search endpoint to find channelId by handle
-        search_url = "https://www.googleapis.com/youtube/v3/search"
+        handle = m.group(1)  # bao gồm dấu @
+
+        # Cách hiện đại (từ 2024+): dùng channels.list + forHandle
+        url = "https://www.googleapis.com/youtube/v3/channels"
         params = {
-            "part": "snippet",
-            "q": handle,
-            "type": "channel",
-            "maxResults": 1,
+            "part": "id",
+            "forHandle": handle,
             "key": api_key,
         }
-        r = requests.get(search_url, params=params, timeout=30)
-        if r.status_code >= 300:
-            raise ValueError(f"YouTube search failed: {r.status_code} {r.text}")
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()  # tự raise nếu 4xx/5xx
 
         data = r.json()
         items = data.get("items", [])
         if not items:
             raise ValueError(f"Cannot resolve channel id from handle: {handle}")
 
-        ch_id = items[0].get("snippet", {}).get("channelId") or items[0].get("id", {}).get("channelId")
-        if not ch_id:
-            raise ValueError(f"Search returned no channelId for handle: {handle}")
-
-        return ch_id
+        return items[0]["id"]
 
     raise ValueError(
-        "Unsupported YouTube channel URL format. Supported: /channel/UC... or /@handle (with optional trailing routes)."
-    )
+        "Unsupported YouTube channel URL format. "
+        "Supported: /channel/UC... or /@handle"
+	)
+
 
 def youtube_get_channel_title(yt_api_key: str, channel_id: str) -> str:
 	r = requests.get(
