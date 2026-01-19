@@ -4,26 +4,78 @@ import requests
 from ..utils import safe_json
 from datetime import datetime
 import logging
-
+import re
 logger = logging.getLogger(__name__)
+from urllib.parse import urlparse
 
 
-def youtube_channel_id_from_url(yt_api_key: str, channel_url: str) -> str:
-	if "/channel/" in channel_url:
-		return channel_url.split("/channel/")[1].split("?")[0].strip("/")
-	if "/@" in channel_url:
-		handle = channel_url.split("/@")[1].split("?")[0].strip("/")
-		r = requests.get(
-			"https://www.googleapis.com/youtube/v3/channels",
-			params={"forHandle": handle, "key": yt_api_key, "part": "id"}
-		)
-		jd = safe_json(r)
-		if not jd.get("items"):
-			logger.error("youtube_channel_id_from_url: channel not found by handle %s (resp: %s)", handle, jd)
-			raise ValueError("Channel not found by handle")
-		return jd["items"][0]["id"]
-	raise ValueError("Invalid channel URL format. Use /channel/UC... or /@handle")
+def youtube_channel_id_from_url(api_key: str, channel_url: str) -> str:
+    """
+    Supports:
+      - https://www.youtube.com/channel/UCxxxx
+      - https://www.youtube.com/channel/UCxxxx/videos
+      - https://www.youtube.com/@handle
+      - https://www.youtube.com/@handle/featured (or /videos, /shorts, /live, /about, ...)
+    Notes:
+      - /c/<name> and /user/<name> are NOT handled here (can be added later).
+    """
+    if not channel_url or not isinstance(channel_url, str):
+        raise ValueError("Invalid channel_url")
 
+    u = channel_url.strip()
+
+    # Ensure scheme
+    if not re.match(r"^https?://", u, re.IGNORECASE):
+        u = "https://" + u
+
+    parsed = urlparse(u)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    # Normalize path: remove multiple slashes and trailing slash
+    path = re.sub(r"/{2,}", "/", path).rstrip("/")
+
+    # Quick check for youtube domains
+    if "youtube.com" not in host and "youtu.be" not in host:
+        raise ValueError(f"Not a YouTube URL: {channel_url}")
+
+    # 1) /channel/UCxxxx... (even if has extra segments after)
+    m = re.search(r"/channel/(UC[a-zA-Z0-9_-]+)", path)
+    if m:
+        return m.group(1)
+
+    # 2) /@handle[/...]
+    # Grab the first segment that starts with '@'
+    m = re.search(r"/(@[^/]+)", path)
+    if m:
+        handle = m.group(1)  # like "@KIENTHUCQUANHTA247"
+        # Use YouTube search endpoint to find channelId by handle
+        search_url = "https://www.googleapis.com/youtube/v3/search"
+        params = {
+            "part": "snippet",
+            "q": handle,
+            "type": "channel",
+            "maxResults": 1,
+            "key": api_key,
+        }
+        r = requests.get(search_url, params=params, timeout=30)
+        if r.status_code >= 300:
+            raise ValueError(f"YouTube search failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        items = data.get("items", [])
+        if not items:
+            raise ValueError(f"Cannot resolve channel id from handle: {handle}")
+
+        ch_id = items[0].get("snippet", {}).get("channelId") or items[0].get("id", {}).get("channelId")
+        if not ch_id:
+            raise ValueError(f"Search returned no channelId for handle: {handle}")
+
+        return ch_id
+
+    raise ValueError(
+        "Unsupported YouTube channel URL format. Supported: /channel/UC... or /@handle (with optional trailing routes)."
+    )
 
 def youtube_get_channel_title(yt_api_key: str, channel_id: str) -> str:
 	r = requests.get(
