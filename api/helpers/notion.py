@@ -6,7 +6,7 @@ from ..config import NOTION_VERSION
 from ..utils import safe_json, get_property_value
 from datetime import datetime
 from collections import defaultdict
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +158,6 @@ def insert_video_batch(
 	videos_data: List[Dict[str, any]],
 	max_workers: int = 8
 ):
-	from concurrent.futures import ThreadPoolExecutor, as_completed
-
 	def insert_single(video: Dict[str, any]):
 		retries = 0
 		max_retries = 3
@@ -201,6 +199,67 @@ def notion_retrieve_page(notion_api_key: str, page_id: str) -> dict:
 	return r.json()
 
 
+# === Helpers cho logic Update/Insert song song ===
+
+def _execute_batch_actions(notion_api_key: str, to_update: list, to_insert: list, to_delete: list):
+	"""
+	Hàm helper thực thi song song các hành động: Update, Insert, Delete (Archive).
+	"""
+	workers = 20
+	total_ops = len(to_update) + len(to_insert) + len(to_delete)
+	if total_ops == 0:
+		return
+
+	def do_update(item):
+		# item = (page_id, props)
+		pid, props = item
+		try:
+			r = requests.patch(
+				f"https://api.notion.com/v1/pages/{pid}",
+				headers=notion_headers(notion_api_key),
+				json={"properties": props}
+			)
+			if r.status_code >= 300:
+				logger.warning(f"Failed update page {pid}: {r.text}")
+		except Exception as e:
+			logger.error(f"Ex update {pid}: {e}")
+
+	def do_insert(item):
+		# item = (db_id, props)
+		db_id, props = item
+		try:
+			r = requests.post(
+				"https://api.notion.com/v1/pages",
+				headers=notion_headers(notion_api_key),
+				json={"parent": {"database_id": db_id}, "properties": props}
+			)
+			if r.status_code >= 300:
+				logger.warning(f"Failed insert: {r.text}")
+		except Exception as e:
+			logger.error(f"Ex insert: {e}")
+
+	def do_delete(pid):
+		try:
+			requests.patch(
+				f"https://api.notion.com/v1/pages/{pid}",
+				headers=notion_headers(notion_api_key),
+				json={"archived": True}
+			)
+		except Exception as e:
+			logger.error(f"Ex delete {pid}: {e}")
+
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit updates
+		for item in to_update:
+			executor.submit(do_update, item)
+		# Submit inserts
+		for item in to_insert:
+			executor.submit(do_insert, item)
+		# Submit deletes
+		for pid in to_delete:
+			executor.submit(do_delete, pid)
+
+
 def ensure_daily_stats_database(notion_api_key: str, parent_page_id: str) -> str:
 	r = requests.get(
 		f"https://api.notion.com/v1/blocks/{parent_page_id}/children",
@@ -238,86 +297,7 @@ def ensure_daily_stats_database(notion_api_key: str, parent_page_id: str) -> str
 	return r.json()["id"]
 
 
-def sync_daily_stats_rows(notion_api_key: str, db_id: str, daily_stats: List[dict]):
-	existing_dates = set()
-	has_more = True
-	next_cursor = None
-
-	while has_more:
-		query_payload = {"page_size": 100}
-		if next_cursor:
-			query_payload["start_cursor"] = next_cursor
-
-		r = requests.post(
-			f"https://api.notion.com/v1/databases/{db_id}/query",
-			headers=notion_headers(notion_api_key),
-			json=query_payload
-		)
-		if r.status_code != 200:
-			logger.error(f"Query Daily DB Error: {r.text}")
-			break
-
-		res = r.json()
-		for page in res.get("results", []):
-			props = page.get("properties", {})
-			date_prop = props.get("Date", {})
-			title_parts = date_prop.get("title", [])
-			if title_parts:
-				content = "".join([t.get("text", {}).get("content", "") for t in title_parts])
-				if content:
-					existing_dates.add(content.strip())
-
-		has_more = res.get("has_more", False)
-		next_cursor = res.get("next_cursor")
-
-	to_insert = []
-	for stat in daily_stats:
-		ts = stat.get("date")
-		if not ts:
-			continue
-		dt_str = __import__("datetime").datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
-		if dt_str not in existing_dates:
-			to_insert.append({
-				"date_str": dt_str,
-				"views": stat.get("views"),
-				"views_change": stat.get("views_change"),
-				"subs": stat.get("subscribers"),
-				"subs_change": stat.get("subscribers_change")
-			})
-
-	if not to_insert:
-		logger.info(f"Daily Stats: Không có dữ liệu mới cho DB {db_id}")
-		return 0
-
-	def insert_row(item):
-		props = {
-			"Date": {"title": [{"text": {"content": item["date_str"]}}]},
-			"Views": {"number": item["views"]},
-			"Views Change": {"number": item["views_change"]},
-			"Subscribers": {"number": item["subs"]},
-			"Subscribers Change": {"number": item["subs_change"]},
-		}
-		r_ins = requests.post(
-			"https://api.notion.com/v1/pages",
-			headers=notion_headers(notion_api_key),
-			json={"parent": {"database_id": db_id}, "properties": props}
-		)
-		if r_ins.status_code >= 300:
-			logger.error(f"Insert Daily Row Error: {r_ins.text}")
-
-	from concurrent.futures import ThreadPoolExecutor
-	with ThreadPoolExecutor(max_workers=5) as executor:
-		executor.map(insert_row, to_insert)
-
-	logger.info(f"Đã insert {len(to_insert)} dòng vào Daily Stats DB {db_id}")
-	return len(to_insert)
-
-# Thêm vào cuối file notion.py
-
 def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: str) -> str:
-    """
-    Tìm hoặc tạo database "Combined Daily Stats" dưới parent_page_id
-    """
     r = requests.get(
         f"https://api.notion.com/v1/blocks/{parent_page_id}/children",
         headers=notion_headers(notion_api_key),
@@ -327,7 +307,6 @@ def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: st
         results = r.json().get("results", [])
         for block in results:
             if block.get("type") == "child_database":
-                # Lấy title an toàn hơn: hỗ trợ cả list dict và list string
                 title_parts = block.get("child_database", {}).get("title", [])
                 title = ""
                 for part in title_parts:
@@ -338,7 +317,6 @@ def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: st
                 if title.strip() == "Combined Daily Stats":
                     return block["id"]
 
-    # Nếu chưa có thì tạo mới
     payload = {
         "parent": {"type": "page_id", "page_id": parent_page_id},
         "title": [{"type": "text", "text": {"content": "Combined Daily Stats"}}],
@@ -370,25 +348,26 @@ def sync_combined_daily_stats_rows(
     daily_stats: List[dict]
 ) -> int:
     """
-    Cập nhật daily stats cho một channel vào Combined Daily Stats:
-    - Xóa hết các row cũ của channel đó trước.
-    - Chỉ insert 30 ngày gần nhất từ dữ liệu mới.
+    Tối ưu: 
+    1. Query lấy danh sách row hiện tại (key = Date).
+    2. So khớp với dữ liệu mới (VidIQ).
+    3. Update nếu tồn tại, Insert nếu chưa có, Delete nếu dư thừa (quá cũ).
     """
     channel_name = channel_name.strip()
+    if not daily_stats:
+        return 0
 
-    # === Bước 1: Xóa tất cả các row cũ của channel này ===
+    # 1. Lấy dữ liệu hiện có từ Notion
+    existing_map = {}  # "2025-01-01" -> page_id
     has_more = True
     next_cursor = None
-    deleted_count = 0
-
+    
     while has_more:
         query_payload = {
             "page_size": 100,
             "filter": {
                 "property": "Channel",
-                "title": {
-                    "equals": channel_name
-                }
+                "title": {"equals": channel_name}
             }
         }
         if next_cursor:
@@ -400,135 +379,103 @@ def sync_combined_daily_stats_rows(
             json=query_payload
         )
         if r.status_code != 200:
-            logger.error(f"Query to delete old rows failed: {r.text}")
+            logger.error(f"Query daily existing failed: {r.text}")
             break
-
+        
         res = r.json()
-        pages = res.get("results", [])
-
-        # Xóa từng page (Notion không hỗ trợ bulk delete, phải xóa từng cái)
-        for page in pages:
-            page_id = page["id"]
-            # Archive (soft delete) thay vì delete cứng để an toàn
-            archive_r = requests.patch(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers=notion_headers(notion_api_key),
-                json={"archived": True}
-            )
-            if archive_r.status_code == 200:
-                deleted_count += 1
-            else:
-                logger.warning(f"Failed to archive old row {page_id}: {archive_r.text}")
+        for page in res.get("results", []):
+            # Lấy Date từ property
+            props = page.get("properties", {})
+            date_prop = props.get("Date", {})
+            date_val = date_prop.get("date", {})
+            if date_val:
+                d_str = date_val.get("start") # "2025-01-01"
+                if d_str:
+                    existing_map[d_str] = page["id"]
 
         has_more = res.get("has_more", False)
         next_cursor = res.get("next_cursor")
 
-    logger.info(f"Đã xóa/archived {deleted_count} dòng cũ của channel '{channel_name}'")
-
-    # === Bước 2: Chỉ lấy 30 ngày gần nhất từ daily_stats ===
-    if not daily_stats:
-        logger.info(f"Không có daily stats để insert cho {channel_name}")
-        return 0
-
-    # Sắp xếp theo date giảm dần (mới nhất trước)
+    # 2. Chuẩn bị lists Update/Insert
+    to_update = []
+    to_insert = []
+    
+    # Chỉ lấy 30 ngày gần nhất để sync
     sorted_stats = sorted(daily_stats, key=lambda x: x.get("date", 0), reverse=True)
     recent_30_days = sorted_stats[:30]
+    
+    processed_dates = set()
 
-    if len(recent_30_days) < len(sorted_stats):
-        logger.info(f"Chỉ lấy 30 ngày gần nhất (bỏ qua {len(sorted_stats) - 30} ngày cũ hơn)")
-
-    # === Bước 3: Insert dữ liệu mới ===
-    to_insert = []
     for stat in recent_30_days:
         ts = stat.get("date")
         if not ts:
             continue
-        dt_str = __import__("datetime").datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
-
-        to_insert.append({
-            "channel": channel_name,
-            "date_str": dt_str,
-            "subscribers": stat.get("subscribers"),
-            "total_views": stat.get("views"),
-            "views_change": stat.get("views_change"),
-        })
-
-    if not to_insert:
-        logger.info(f"Không có dữ liệu hợp lệ để insert cho {channel_name}")
-        return 0
-
-    def insert_row(item: dict):
-        props = {
-            "Channel": {"title": [{"text": {"content": item["channel"]}}]},
-            "Date": {"date": {"start": item["date_str"]}},
-            "Subscribers": {"number": item["subscribers"] if item["subscribers"] is not None else None},
-            "Total Views": {"number": item["total_views"] if item["total_views"] is not None else None},
-            "Views Change": {"number": item["views_change"] if item["views_change"] is not None else None},
+        dt_str = datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d')
+        
+        processed_dates.add(dt_str)
+        
+        row_props = {
+            "Channel": {"title": [{"text": {"content": channel_name}}]},
+            "Date": {"date": {"start": dt_str}},
+            "Subscribers": {"number": stat.get("subscribers")},
+            "Total Views": {"number": stat.get("views")},
+            "Views Change": {"number": stat.get("views_change")},
         }
-        r_ins = requests.post(
-            "https://api.notion.com/v1/pages",
-            headers=notion_headers(notion_api_key),
-            json={"parent": {"database_id": db_id}, "properties": props}
-        )
-        if r_ins.status_code >= 300:
-            logger.error(f"Insert Combined Row Error: {r_ins.text}")
 
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        executor.map(insert_row, to_insert)
+        if dt_str in existing_map:
+            # Row đã tồn tại -> Update
+            page_id = existing_map[dt_str]
+            to_update.append((page_id, row_props))
+        else:
+            # Row chưa tồn tại -> Insert
+            to_insert.append((db_id, row_props))
 
-    logger.info(f"Đã insert {len(to_insert)} dòng (30 ngày gần nhất) cho {channel_name}")
-    return len(to_insert)
+    # 3. Tìm các row cũ không còn trong 30 ngày này để xóa (Cleanup)
+    to_delete = []
+    for date_str, page_id in existing_map.items():
+        if date_str not in processed_dates:
+            to_delete.append(page_id)
 
-
+    # 4. Thực thi song song
+    logger.info(f"Daily Sync '{channel_name}': {len(to_update)} updates, {len(to_insert)} inserts, {len(to_delete)} deletes.")
+    _execute_batch_actions(notion_api_key, to_update, to_insert, to_delete)
+    
+    return len(to_update) + len(to_insert)
 
 
 def calculate_monthly_views_gained(daily_stats: List[dict]) -> List[dict]:
-    """
-    Từ daily_stats của VidIQ, tính tổng views gained theo từng tháng.
-    Trả về list các dict: {month_str: '2025-01', views_gained: 1234567}
-    Chỉ lấy các tháng có dữ liệu đầy đủ (hoặc gần đầy).
-    """
     if not daily_stats:
         return []
 
-    # Sắp xếp daily_stats theo date tăng dần (cũ → mới)
     sorted_stats = sorted(daily_stats, key=lambda x: x.get("date", 0))
-
     monthly_gained = defaultdict(int)
-    monthly_total_views = {}  # để lưu total views cuối tháng
+    monthly_total_views = {}
 
     for stat in sorted_stats:
         ts = stat.get("date")
         if not ts:
             continue
         dt = datetime.utcfromtimestamp(ts)
-        month_key = dt.strftime('%Y-%m')  # ví dụ: "2025-01"
+        month_key = dt.strftime('%Y-%m')
 
         views_change = stat.get("views_change", 0)
         if views_change > 0:
             monthly_gained[month_key] += views_change
 
-        # Cập nhật total views cuối cùng của tháng
         monthly_total_views[month_key] = stat.get("views", 0)
 
-    # Chuyển sang list và sort theo tháng mới nhất trước
     result = []
     for month_key in sorted(monthly_gained.keys(), reverse=True):
         result.append({
-            "month": month_key,                    # '2025-01'
+            "month": month_key,
             "views_gained": monthly_gained[month_key],
             "total_views_at_end": monthly_total_views.get(month_key, 0)
         })
 
-    # Chỉ lấy 24 tháng gần nhất (đủ để biểu đồ đẹp mà không quá dài)
     return result[:24]
 
 
 def ensure_combined_monthly_stats_database(notion_api_key: str, parent_page_id: str) -> str:
-    """
-    Tìm hoặc tạo database "Combined Monthly Stats" dưới parent_page_id
-    """
     r = requests.get(
         f"https://api.notion.com/v1/blocks/{parent_page_id}/children",
         headers=notion_headers(notion_api_key),
@@ -547,13 +494,12 @@ def ensure_combined_monthly_stats_database(notion_api_key: str, parent_page_id: 
                 if title.strip() == "Combined Monthly Stats":
                     return block["id"]
 
-    # Tạo mới nếu chưa có
     payload = {
         "parent": {"type": "page_id", "page_id": parent_page_id},
         "title": [{"type": "text", "text": {"content": "Combined Monthly Stats"}}],
         "properties": {
             "Channel": {"title": {}},
-            "Month": {"date": {}},                    # dùng date để dễ sort và filter
+            "Month": {"date": {}},
             "Views Gained": {"number": {"format": "number"}},
             "Total Views": {"number": {"format": "number"}},
         }
@@ -578,16 +524,16 @@ def sync_combined_monthly_stats_rows(
     monthly_stats: List[dict]
 ) -> int:
     """
-    Đồng bộ monthly stats cho một kênh vào Combined Monthly Stats DB
-    - Xóa hết row cũ của channel đó
-    - Insert các tháng gần nhất (từ monthly_stats)
+    Tối ưu Monthly Sync: Upsert (Update existing, Insert new).
     """
     channel_name = channel_name.strip()
+    if not monthly_stats:
+        return 0
 
-    # === Xóa row cũ của channel ===
+    # 1. Lấy dữ liệu hiện có
+    existing_map = {} # "2025-01-01" -> page_id
     has_more = True
     next_cursor = None
-    deleted_count = 0
 
     while has_more:
         query_payload = {
@@ -606,51 +552,53 @@ def sync_combined_monthly_stats_rows(
             json=query_payload
         )
         if r.status_code != 200:
-            logger.error(f"Query monthly delete failed: {r.text}")
+            logger.error(f"Query monthly existing failed: {r.text}")
             break
 
         res = r.json()
         for page in res.get("results", []):
-            page_id = page["id"]
-            archive_r = requests.patch(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers=notion_headers(notion_api_key),
-                json={"archived": True}
-            )
-            if archive_r.status_code == 200:
-                deleted_count += 1
+            props = page.get("properties", {})
+            date_prop = props.get("Month", {})
+            date_val = date_prop.get("date", {})
+            if date_val:
+                d_str = date_val.get("start")
+                if d_str:
+                    existing_map[d_str] = page["id"]
 
         has_more = res.get("has_more", False)
         next_cursor = res.get("next_cursor")
 
-    logger.info(f"Đã xóa {deleted_count} dòng monthly cũ của '{channel_name}'")
+    # 2. Phân loại Update/Insert
+    to_update = []
+    to_insert = []
+    processed_months = set()
 
-    # === Insert dữ liệu mới ===
-    if not monthly_stats:
-        return 0
-
-    def insert_row(item: dict):
-        # Month format: "2025-01" → dùng ngày đầu tháng làm date
+    for item in monthly_stats:
+        # item['month'] = "2025-01" -> Cần chuyển thành "2025-01-01" để lưu vào Notion Date
         year, month = item["month"].split("-")
         date_start = f"{year}-{month}-01"
+        processed_months.add(date_start)
 
-        props = {
+        row_props = {
             "Channel": {"title": [{"text": {"content": channel_name}}]},
             "Month": {"date": {"start": date_start}},
             "Views Gained": {"number": item["views_gained"]},
             "Total Views": {"number": item["total_views_at_end"]},
         }
-        r_ins = requests.post(
-            "https://api.notion.com/v1/pages",
-            headers=notion_headers(notion_api_key),
-            json={"parent": {"database_id": db_id}, "properties": props}
-        )
-        if r_ins.status_code >= 300:
-            logger.error(f"Insert Monthly Row Error: {r_ins.text}")
 
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        executor.map(insert_row, monthly_stats)
+        if date_start in existing_map:
+            to_update.append((existing_map[date_start], row_props))
+        else:
+            to_insert.append((db_id, row_props))
 
-    logger.info(f"Đã insert {len(monthly_stats)} dòng monthly cho '{channel_name}'")
-    return len(monthly_stats)
+    # 3. Cleanup (Xóa các tháng cũ không còn trong list trả về - optional, nhưng tốt cho sync)
+    to_delete = []
+    for d_str, pid in existing_map.items():
+        if d_str not in processed_months:
+            to_delete.append(pid)
+
+    # 4. Thực thi song song
+    logger.info(f"Monthly Sync '{channel_name}': {len(to_update)} updates, {len(to_insert)} inserts.")
+    _execute_batch_actions(notion_api_key, to_update, to_insert, to_delete)
+
+    return len(to_update) + len(to_insert)
