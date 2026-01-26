@@ -231,3 +231,89 @@ def get_upload_frequency(yt_api_key: str, channel_id: str) -> str:
 		logger.exception("get_upload_frequency failed for channel %s", channel_id)
 		return "Lỗi khi lấy dữ liệu"
 
+
+
+def youtube_get_video_comments(yt_api_key: str, video_id: str, max_results: int = None) -> List[dict]:
+    """
+    Lấy comment thread và replies.
+    Nếu max_results=None, sẽ lấy TOÀN BỘ (phân trang).
+    """
+    url = "https://www.googleapis.com/youtube/v3/commentThreads"
+    comments_data = []
+    next_page_token = None
+    
+    # Nếu max_results không set, ta để số rất lớn để vòng lặp chạy 'mãi'
+    # Tuy nhiên mỗi request YouTube chỉ trả về tối đa 100 items
+    target_count = max_results if max_results else float('inf')
+
+    while len(comments_data) < target_count:
+        try:
+            params = {
+                "part": "snippet,replies",
+                "videoId": video_id,
+                "key": yt_api_key,
+                "maxResults": 100, # Lấy tối đa mỗi lần gọi
+                "textFormat": "plainText",
+                "order": "relevance"
+            }
+            if next_page_token:
+                params["pageToken"] = next_page_token
+
+            r = requests.get(url, params=params, timeout=20)
+            
+            if r.status_code in [403, 404]:
+                logger.warning(f"Video {video_id}: Comments disabled/not found.")
+                break
+            
+            if r.status_code >= 300:
+                logger.error(f"YouTube API Error: {r.status_code} {r.text}")
+                break
+
+            data = safe_json(r)
+            items = data.get("items", [])
+            
+            if not items:
+                break
+
+            for item in items:
+                # 1. Parse Comment Gốc
+                top_obj = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
+                
+                thread = {
+                    "author": top_obj.get("authorDisplayName", "Anonymous"),
+                    "text": top_obj.get("textDisplay", ""),
+                    "likes": top_obj.get("likeCount", 0),
+                    "replies": []
+                }
+                
+                # 2. Parse Replies
+                replies_wrapper = item.get("replies", {})
+                if replies_wrapper:
+                    replies_list = replies_wrapper.get("comments", [])
+                    for rep in replies_list:
+                        r_snip = rep.get("snippet", {})
+                        thread["replies"].append({
+                            "author": r_snip.get("authorDisplayName", "Anonymous"),
+                            "text": r_snip.get("textDisplay", ""),
+                            "likes": r_snip.get("likeCount", 0) # Lấy like reply
+                        })
+                
+                comments_data.append(thread)
+                
+                # Nếu đã đủ số lượng yêu cầu (trường hợp user set limit) thì dừng
+                if len(comments_data) >= target_count:
+                    break
+            
+            # Kiểm tra xem còn trang sau không
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token:
+                break
+                
+            # Nghỉ nhẹ để tránh spam API quá gắt
+            time.sleep(0.1)
+
+        except Exception as e:
+            logger.error(f"Error loop comments video {video_id}: {e}")
+            break
+
+    return comments_data
