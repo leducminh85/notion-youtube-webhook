@@ -885,3 +885,116 @@ def append_blocks_to_page_safe(notion_api_key: str, page_id: str, blocks: List[d
                     all_success = False
 
     return all_success
+
+
+def create_video_header_block(notion_api_key: str, parent_page_id: str, video_title: str, video_url: str) -> str:
+    """
+    Tạo một Toggle Heading 2 rỗng và trả về ID của nó.
+    Đây là 'cái vỏ' để chứa tất cả comment.
+    """
+    # Tạo block link video để nhét vào đầu toggle
+    link_block = {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [
+                {
+                    "type": "text", 
+                    "text": {"content": "Watch Video: "}, 
+                    "annotations": {"italic": True}
+                },
+                {
+                    "type": "text", 
+                    "text": {"content": video_url, "link": {"url": video_url}}
+                }
+            ]
+        }
+    }
+
+    # Payload tạo Toggle Heading
+    block_payload = {
+        "children": [
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [{"type": "text", "text": {"content": video_title[:2000]}}], # Cắt ngắn nếu title quá dài
+                    "is_toggleable": True,
+                    "children": [link_block] # Tạo sẵn link bên trong
+                }
+            }
+        ]
+    }
+
+    url = f"https://api.notion.com/v1/blocks/{parent_page_id}/children"
+    r = requests.patch(url, headers=notion_headers(notion_api_key), json=block_payload)
+    
+    if r.status_code >= 300:
+        logger.error(f"Failed to create header: {r.text}")
+        return None
+    
+    # Lấy ID của cái Heading 2 vừa tạo
+    results = r.json().get("results", [])
+    if results:
+        return results[0]["id"]
+    return None
+
+
+def format_comment_list(comments: List[dict]) -> List[dict]:
+    """
+    Chuyển đổi list comments thành list Notion Blocks.
+    KHÔNG chia pagination, KHÔNG tạo vỏ heading.
+    """
+    blocks = []
+    
+    for c in comments:
+        c_text = (c["text"] or "")[:1000]
+        
+        # Block Comment gốc
+        parent_rich_text = [
+            {
+                "type": "text", 
+                "text": {"content": f"{c['author']} ({c['likes']}👍): "}, 
+                "annotations": {"bold": True, "color": "blue"}
+            },
+            {
+                "type": "text", 
+                "text": {"content": c_text}
+            }
+        ]
+        
+        # Block Replies
+        replies_blocks = []
+        for r in c["replies"]:
+            r_text = (r["text"] or "")[:1000]
+            r_likes = r.get("likes", 0)
+            
+            replies_blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [
+                        {
+                            "type": "text", 
+                            "text": {"content": f"↳ {r['author']} ({r_likes}👍): "}, 
+                            "annotations": {"italic": True, "color": "gray"}
+                        },
+                        {
+                            "type": "text", 
+                            "text": {"content": r_text}
+                        }
+                    ]
+                }
+            })
+
+        # Gom vào 1 Toggle nhỏ cho từng thread comment
+        blocks.append({
+            "object": "block",
+            "type": "toggle", 
+            "toggle": {
+                "rich_text": parent_rich_text,
+                "children": replies_blocks if replies_blocks else []
+            }
+        })
+        
+    return blocks

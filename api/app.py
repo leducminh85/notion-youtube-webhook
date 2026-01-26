@@ -25,6 +25,8 @@ from .helpers.notion import (
     ensure_combined_daily_stats_database,
     sync_combined_daily_stats_rows,
     sync_combined_monthly_stats_rows,
+    format_comment_list,           
+    create_video_header_block
 )
 from .helpers.vidiq import vidiq_fetch_data
 from .utils import get_property_value
@@ -534,40 +536,46 @@ def get_channel_views_monthly():
 comment_executor = ThreadPoolExecutor(max_workers=4)
 
 def process_single_video_comments(video, yt_key, notion_key, repo_page_id):
-    """Hàm worker xử lý 1 video riêng biệt"""
+    """Hàm worker xử lý 1 video"""
     try:
         snip = video.get("snippet", {})
         v_id = snip.get("resourceId", {}).get("videoId")
         v_title = snip.get("title", "No Title")
 
-        if not v_id: 
-            return 0
+        if not v_id: return 0
 
-        # 1. Lấy comments từ YouTube (IO Bound)
-        # Giảm max_results xuống một chút nếu muốn nhanh hơn, hoặc giữ nguyên
+        # 1. Lấy toàn bộ comments
         comments = youtube_get_video_comments(yt_key, v_id, max_results=None)
+        if not comments: return 0
 
-        if not comments:
+        comments.sort(key=lambda c: c.get("likes", 0), reverse=True)
+        
+        # Log info
+        logger.info(f"   -> {v_title}: Found {len(comments)} comments. Saving...")
+
+        # 2. BƯỚC QUAN TRỌNG: Tạo cái vỏ (Header) trước
+        # Trả về ID của cái Toggle Heading
+        header_block_id = create_video_header_block(notion_key, repo_page_id, f"{v_title} ({len(comments)})", f"https://youtu.be/{v_id}")
+        
+        if not header_block_id:
+            logger.error(f"❌ Failed to create header for {v_title}")
             return 0
 
-        # Sort theo like để comment chất lượng lên đầu
-        comments.sort(key=lambda c: c.get("likes", 0), reverse=True)
+        # 3. Format nội dung (chỉ là list các blocks comment)
+        comment_blocks = format_comment_list(comments)
 
-        # 2. Format dữ liệu (CPU Bound - rất nhanh)
-        blocks = format_comment_blocks(v_title, f"https://youtu.be/{v_id}", comments)
-
-        # 3. Đẩy lên Notion (IO Bound - Chậm nhất)
-        success = append_blocks_to_page_safe(notion_key, repo_page_id, blocks)
+        # 4. Đẩy comment vào TRONG cái vỏ vừa tạo
+        # Hàm append_blocks_to_page_safe dùng được cho cả Page ID và Block ID
+        success = append_blocks_to_page_safe(notion_key, header_block_id, comment_blocks)
         
         if success:
-            logger.info(f"✅ Saved comments for: {v_title}")
             return 1
         return 0
 
     except Exception as e:
         logger.error(f"❌ Error processing video {video.get('snippet', {}).get('title')}: {e}")
         return 0
-
+    
 def task_fetch_comments(yt_key, notion_key, channel_id, parent_page_id):
     logger.info(f"🚀 [START] Background task fetch comments for Channel ID: {channel_id}")
     
