@@ -602,3 +602,270 @@ def sync_combined_monthly_stats_rows(
     _execute_batch_actions(notion_api_key, to_update, to_insert, to_delete)
 
     return len(to_update) + len(to_insert)
+
+
+
+# --- ADD TO notion.py ---
+
+def create_child_page(notion_api_key: str, parent_page_id: str, title: str) -> str:
+    """Tạo một page con trống và trả về ID của nó."""
+    url = "https://api.notion.com/v1/pages"
+    payload = {
+        "parent": {"page_id": parent_page_id},
+        "properties": {
+            "title": {"title": [{"text": {"content": title}}]}
+        }
+    }
+    r = requests.post(url, headers=notion_headers(notion_api_key), json=payload)
+    if r.status_code >= 300:
+        logger.error(f"Create child page failed: {r.text}")
+        raise ValueError(f"Cannot create page: {r.text}")
+    return r.json()["id"]
+
+
+def append_blocks_to_page(notion_api_key: str, page_id: str, blocks: List[dict]):
+    """Append blocks vào page, tự động chia batch 100 blocks."""
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    
+    # Notion chỉ cho phép tối đa 100 blocks mỗi request
+    batch_size = 100
+    for i in range(0, len(blocks), batch_size):
+        batch = blocks[i : i + batch_size]
+        r = requests.patch(url, headers=notion_headers(notion_api_key), json={"children": batch})
+        if r.status_code >= 300:
+            logger.error(f"Append blocks failed at index {i}: {r.text}")
+            # Không raise error để cố gắng append các batch sau (nếu có)
+
+
+def format_comments_to_blocks(video_title: str, video_url: str, comments: List[dict]) -> List[dict]:
+
+
+
+
+    """
+    Chuyển data comment thành cấu trúc Block Notion.
+    Cấu trúc: Toggle Heading 2 (Video Title) -> Bulleted List (Comments) -> Bulleted List (Replies)
+    """
+    if not comments:
+        return []
+
+    # Nội dung bên trong Toggle
+    children_blocks = []
+    
+    # Thêm link video ở đầu
+    children_blocks.append({
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [
+                {"type": "text", "text": {"content": "Watch Video: "}},
+                {"type": "text", "text": {"content": video_url, "link": {"url": video_url}}}
+            ]
+        }
+    })
+
+    for c in comments:
+        # Top level comment
+        text_content = c.get("text", "")[:1800] # Cắt ngắn nếu quá dài (Notion limit 2000)
+        author = c.get("author", "Unknown")
+        likes = c.get("like_count", 0)
+        
+        comment_text_obj = [
+            {"type": "text", "text": {"content": f"{author} ({likes}👍): ", "annotations": {"bold": True}}},
+            {"type": "text", "text": {"content": text_content}}
+        ]
+
+        # Prepare replies blocks (nested list)
+        replies_blocks = []
+        for rep in c.get("replies", []):
+            r_text = rep.get("text", "")[:1800]
+            r_author = rep.get("author", "Unknown")
+            replies_blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": f"{r_author}: ", "annotations": {"italic": True}}},
+                        {"type": "text", "text": {"content": r_text}}
+                    ]
+                }
+            })
+
+        # Block comment gốc
+        block_item = {
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {
+                "rich_text": comment_text_obj,
+                # Nếu có replies, nhét vào children của block này
+                "children": replies_blocks if replies_blocks else []
+            }
+        }
+        children_blocks.append(block_item)
+
+    # Wrap tất cả vào 1 Toggle Heading
+    wrapper_block = {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": video_title[:100]}}], # Title ngắn gọn
+            "is_toggleable": True,
+            "children": children_blocks
+        }
+    }
+
+    return [wrapper_block]
+
+
+# --- THÊM VÀO CUỐI FILE notion.py ---
+
+def ensure_child_page_exists(notion_api_key: str, parent_page_id: str, title_query: str) -> str:
+    """
+    Tìm page con có title khớp. Nếu có trả về ID, nếu không tạo mới.
+    """
+    # 1. Tìm kiếm page con hiện có
+    url_children = f"https://api.notion.com/v1/blocks/{parent_page_id}/children"
+    try:
+        r = requests.get(url_children, headers=notion_headers(notion_api_key), params={"page_size": 100})
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            for block in results:
+                if block.get("type") == "child_page":
+                    child_title = block.get("child_page", {}).get("title", "")
+                    if child_title == title_query:
+                        return block["id"]
+    except Exception as e:
+        logger.warning(f"Failed to list children: {e}")
+
+    # 2. Nếu không tìm thấy, tạo mới
+    url_create = "https://api.notion.com/v1/pages"
+    payload = {
+        "parent": {"page_id": parent_page_id},
+        "properties": {
+            "title": {"title": [{"text": {"content": title_query}}]}
+        }
+    }
+    r = requests.post(url_create, headers=notion_headers(notion_api_key), json=payload)
+    if r.status_code >= 300:
+        raise ValueError(f"Cannot create child page: {r.text}")
+    return r.json()["id"]
+
+
+def format_comment_blocks(video_title: str, video_url: str, comments: List[dict]) -> List[dict]:
+    """
+    Format Notion Blocks với Toggle.
+    FIX: Cắt danh sách comment xuống tối đa 98 item để tránh lỗi 'children length > 100'.
+    """
+    if not comments:
+        return []
+
+    # --- FIX AN TOÀN: Chỉ lấy tối đa 95 comment ---
+    # Notion cho phép tối đa 100 children. 
+    # 1 block Link + 95 blocks Comment = 96 blocks (An toàn)
+    safe_comments = comments[:95]
+
+    inner_blocks = []
+    
+    # 1. Block Link Video
+    inner_blocks.append({
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [
+                {
+                    "type": "text", 
+                    "text": {"content": "Watch Video: "}, 
+                    "annotations": {"italic": True}
+                },
+                {
+                    "type": "text", 
+                    "text": {"content": "Click Here", "link": {"url": video_url}}
+                }
+            ]
+        }
+    })
+
+    for c in safe_comments:
+        # Cắt ngắn text
+        c_text = (c["text"] or "")[:1000]
+        
+        # Nội dung Comment gốc
+        parent_rich_text = [
+            {
+                "type": "text", 
+                "text": {"content": f"{c['author']} ({c['likes']}👍): "}, 
+                "annotations": {"bold": True, "color": "blue"}
+            },
+            {
+                "type": "text", 
+                "text": {"content": c_text}
+            }
+        ]
+        
+        # Nội dung Replies
+        replies_blocks = []
+        for r in c["replies"]:
+            r_text = (r["text"] or "")[:1000]
+            replies_blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [
+                        {
+                            "type": "text", 
+                            "text": {"content": f"↳ {r['author']}: "}, 
+                            "annotations": {"italic": True, "color": "gray"}
+                        },
+                        {
+                            "type": "text", 
+                            "text": {"content": r_text}
+                        }
+                    ]
+                }
+            })
+
+        inner_blocks.append({
+            "object": "block",
+            "type": "toggle", 
+            "toggle": {
+                "rich_text": parent_rich_text,
+                "children": replies_blocks if replies_blocks else []
+            }
+        })
+
+    # Bọc tất cả trong 1 Heading Toggle lớn
+    wrapper = {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": f"{video_title[:90]} ({len(safe_comments)} cmts)"}}],
+            "is_toggleable": True,
+            "children": inner_blocks
+        }
+    }
+    return [wrapper]
+
+def append_blocks_to_page_safe(notion_api_key: str, page_id: str, blocks: List[dict]) -> bool:
+    """Gửi block lên Notion có chia batch và LOG ERROR"""
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    chunk_size = 50
+    all_success = True
+
+    for i in range(0, len(blocks), chunk_size):
+        batch = blocks[i:i+chunk_size]
+        try:
+            r = requests.patch(url, headers=notion_headers(notion_api_key), json={"children": batch})
+            
+            if r.status_code >= 300:
+                # IN RA LỖI CHI TIẾT TỪ NOTION
+                logger.error(f"❌ NOTION API ERROR (Append): {r.status_code} - {r.text}")
+                all_success = False
+            else:
+                # logger.info(f"   (Notion Append Batch {i} OK)")
+                pass
+
+        except Exception as e:
+            logger.error(f"❌ Exception sending to Notion: {e}")
+            all_success = False
+            
+    return all_success

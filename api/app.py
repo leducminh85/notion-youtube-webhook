@@ -1,3 +1,4 @@
+from datetime import datetime
 from flask import Flask, request, jsonify
 import os
 import logging
@@ -27,6 +28,11 @@ from .helpers.notion import (
 )
 from .helpers.vidiq import vidiq_fetch_data
 from .utils import get_property_value
+
+from concurrent.futures import ThreadPoolExecutor
+from .helpers.youtube import youtube_get_video_comments
+from .helpers.notion import ensure_child_page_exists, format_comment_blocks, append_blocks_to_page_safe
+
 
 app = Flask(__name__)
 
@@ -525,6 +531,116 @@ def get_channel_views_monthly():
         logger.exception(f"/get-channel-views-monthly failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# if __name__ == "__main__":
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host="0.0.0.0", port=port)
+comment_executor = ThreadPoolExecutor(max_workers=4)
+
+def task_fetch_comments(yt_key, notion_key, channel_id, parent_page_id):
+    """
+    Logic chạy ngầm:
+    - Lấy TOÀN BỘ video (limit=None).
+    - Lấy 100 comment/video.
+    - Đẩy lên Notion.
+    """
+    logger.info(f"🚀 [START] Background task fetch comments for Channel ID: {channel_id}")
+    
+    try:
+        # 1. Tạo hoặc lấy Page lưu trữ
+        repo_page_id = ensure_child_page_exists(notion_key, parent_page_id, "💬 Comments Repository")
+        
+        # 2. Thêm header ngày giờ update
+        update_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header_block = [{
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {
+                "rich_text": [
+                    {
+                        "type": "text", 
+                        "text": {"content": f"Update Batch: {update_time}"},
+                        "annotations": {"color": "gray"}
+                    }
+                ]
+            }
+        }]
+        append_blocks_to_page_safe(notion_key, repo_page_id, header_block)
+
+        # 3. Lấy danh sách video (Uploads playlist)
+        uploads_id = youtube_uploads_playlist_id(yt_key, channel_id)
+        
+        # --- UPDATE 1: limit=None (Lấy toàn bộ video thay vì 20) ---
+        logger.info("... Dang lay TOAN BO danh sach video...")
+        videos = youtube_playlist_videos_basic(yt_key, uploads_id, limit=None)
+        logger.info(f"✅ Tim thay tong cong {len(videos)} videos.")
+
+        # 4. Lặp qua từng video
+        count_success = 0
+        for i, vid in enumerate(videos):
+            snip = vid.get("snippet", {})
+            v_id = snip.get("resourceId", {}).get("videoId")
+            v_title = snip.get("title", "No Title")
+            
+            if not v_id: continue
+
+            logger.info(f"[{i+1}/{len(videos)}] Xu ly: {v_title}")
+
+            # --- UPDATE 2: max_results=100 (Lấy tối đa 100 thread) ---
+            comments = youtube_get_video_comments(yt_key, v_id, max_results=30)
+            
+            if comments:
+                # Debug log số lượng reply
+                reply_count = sum(len(c['replies']) for c in comments)
+                logger.info(f"   -> Lay duoc {len(comments)} comments goc & {reply_count} replies.")
+
+                blocks = format_comment_blocks(v_title, f"https://youtu.be/{v_id}", comments)
+                success = append_blocks_to_page_safe(notion_key, repo_page_id, blocks)
+                if success:
+                    count_success += 1
+                
+                # Nghỉ nhẹ để tránh Notion Rate Limit (429) vì gửi nhiều request
+
+        logger.info(f"🏁 [END] Task finished. Updated {count_success} videos.")
+
+    except Exception as e:
+        logger.exception(f"❌ CRITICAL ERROR in task_fetch_comments: {e}")
+
+@app.route("/fetch-channel-comments", methods=["POST"])
+def fetch_channel_comments():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+
+    try:
+        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
+        notion_api_key = os.environ.get("NOTION_API_KEY")
+        
+        # Lấy page_id từ payload (Notion Automation gửi id của page channel)
+        # Cấu trúc payload tùy thuộc vào cách bạn trigger, thường là {"page_id": "..."} hoặc {"data": {"id": "..."}}
+        data = payload.get("data", {})
+        page_id = data.get("id") or payload.get("page_id")
+
+        if not page_id:
+            return jsonify({"status": "error", "message": "Missing page_id"}), 400
+
+        # Lấy thông tin Page để tìm URL kênh -> tìm Channel ID
+        page = notion_retrieve_page(notion_api_key, page_id)
+        props = page.get("properties", {})
+        channel_url = get_property_value(props, "Channel URL")
+        
+        if not channel_url:
+            return jsonify({"status": "error", "message": "Channel URL empty"}), 400
+
+        channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+
+        # Đẩy vào background chạy để trả response ngay cho Notion đỡ đợi
+        comment_executor.submit(task_fetch_comments, yt_api_key, notion_api_key, channel_id, page_id)
+
+        return jsonify({
+            "status": "success", 
+            "message": "Processing comments in background. Check '💬 Comments Repository' page shortly."
+        }), 200
+
+    except Exception as e:
+        logger.exception(f"Endpoint error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

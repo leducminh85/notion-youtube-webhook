@@ -231,3 +231,70 @@ def get_upload_frequency(yt_api_key: str, channel_id: str) -> str:
 		logger.exception("get_upload_frequency failed for channel %s", channel_id)
 		return "Lỗi khi lấy dữ liệu"
 
+
+
+def youtube_get_video_comments(yt_api_key: str, video_id: str, max_results: int = 20) -> List[dict]:
+    """
+    Lấy comment thread và replies.
+    QUAN TRỌNG: params['part'] phải có 'replies'.
+    """
+    url = "https://www.googleapis.com/youtube/v3/commentThreads"
+    params = {
+        "part": "snippet,replies",  # <--- BẮT BUỘC PHẢI CÓ 'replies' Ở ĐÂY
+        "videoId": video_id,
+        "key": yt_api_key,
+        "maxResults": min(100, max_results),
+        "textFormat": "plainText",
+        "order": "relevance"
+    }
+
+    comments_data = []
+    
+    try:
+        r = requests.get(url, params=params)
+        
+        # Nếu video tắt comment hoặc lỗi permission
+        if r.status_code == 403 or r.status_code == 404:
+            logger.warning(f"Video {video_id}: Comments disabled or not found.")
+            return []
+            
+        data = safe_json(r)
+        items = data.get("items", [])
+        
+        for item in items:
+            # 1. Parse Comment Gốc (Top Level)
+            top_obj = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {})
+            
+            thread = {
+                "author": top_obj.get("authorDisplayName", "Anonymous"),
+                "text": top_obj.get("textDisplay", ""),
+                "likes": top_obj.get("likeCount", 0),
+                "replies": []
+            }
+            
+            # 2. Parse Replies (Nằm trong field 'replies')
+            # Lưu ý: YouTube chỉ trả về tối đa 5 reply trong request này.
+            # Nếu item không có key 'replies', nghĩa là không có reply.
+            replies_wrapper = item.get("replies", {})
+            if replies_wrapper:
+                replies_list = replies_wrapper.get("comments", [])
+                
+                # Sắp xếp reply cũ nhất -> mới nhất để dễ đọc (hoặc ngược lại tùy ý)
+                # replies_list.reverse() 
+                
+                for rep in replies_list:
+                    r_snip = rep.get("snippet", {})
+                    thread["replies"].append({
+                        "author": r_snip.get("authorDisplayName", "Anonymous"),
+                        "text": r_snip.get("textDisplay", ""),
+                        "likes": r_snip.get("likeCount", 0)
+                    })
+            
+            comments_data.append(thread)
+            
+    except Exception as e:
+        logger.error(f"Error parsing comments for video {video_id}: {e}")
+        # Không raise lỗi để code tiếp tục chạy video khác
+        pass
+
+    return comments_data
