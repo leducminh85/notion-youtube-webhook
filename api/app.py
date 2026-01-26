@@ -586,6 +586,7 @@ def task_fetch_comments(yt_key, notion_key, channel_id, parent_page_id):
             comments = youtube_get_video_comments(yt_key, v_id, max_results=30)
             
             if comments:
+                comments.sort(key=lambda c: c.get("likes", 0), reverse=True)
                 # Debug log số lượng reply
                 reply_count = sum(len(c['replies']) for c in comments)
                 logger.info(f"   -> Lay duoc {len(comments)} comments goc & {reply_count} replies.")
@@ -642,5 +643,5 @@ def fetch_channel_comments():
         logger.exception(f"Endpoint error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 3000))
     app.run(host="0.0.0.0", port=port)

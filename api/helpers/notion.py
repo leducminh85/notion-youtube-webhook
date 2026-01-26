@@ -806,6 +806,8 @@ def format_comment_blocks(video_title: str, video_url: str, comments: List[dict]
         replies_blocks = []
         for r in c["replies"]:
             r_text = (r["text"] or "")[:1000]
+            r_likes = r.get("likes", 0) 
+
             replies_blocks.append({
                 "object": "block",
                 "type": "bulleted_list_item",
@@ -813,7 +815,7 @@ def format_comment_blocks(video_title: str, video_url: str, comments: List[dict]
                     "rich_text": [
                         {
                             "type": "text", 
-                            "text": {"content": f"↳ {r['author']}: "}, 
+                            "text": {"content": f"↳ {r['author']} ({r_likes}👍): "}, 
                             "annotations": {"italic": True, "color": "gray"}
                         },
                         {
