@@ -533,72 +533,85 @@ def get_channel_views_monthly():
 
 comment_executor = ThreadPoolExecutor(max_workers=4)
 
+def process_single_video_comments(video, yt_key, notion_key, repo_page_id):
+    """Hàm worker xử lý 1 video riêng biệt"""
+    try:
+        snip = video.get("snippet", {})
+        v_id = snip.get("resourceId", {}).get("videoId")
+        v_title = snip.get("title", "No Title")
+
+        if not v_id: 
+            return 0
+
+        # 1. Lấy comments từ YouTube (IO Bound)
+        # Giảm max_results xuống một chút nếu muốn nhanh hơn, hoặc giữ nguyên
+        comments = youtube_get_video_comments(yt_key, v_id, max_results=None)
+
+        if not comments:
+            return 0
+
+        # Sort theo like để comment chất lượng lên đầu
+        comments.sort(key=lambda c: c.get("likes", 0), reverse=True)
+
+        # 2. Format dữ liệu (CPU Bound - rất nhanh)
+        blocks = format_comment_blocks(v_title, f"https://youtu.be/{v_id}", comments)
+
+        # 3. Đẩy lên Notion (IO Bound - Chậm nhất)
+        success = append_blocks_to_page_safe(notion_key, repo_page_id, blocks)
+        
+        if success:
+            logger.info(f"✅ Saved comments for: {v_title}")
+            return 1
+        return 0
+
+    except Exception as e:
+        logger.error(f"❌ Error processing video {video.get('snippet', {}).get('title')}: {e}")
+        return 0
+
 def task_fetch_comments(yt_key, notion_key, channel_id, parent_page_id):
-    """
-    Logic chạy ngầm:
-    - Lấy TOÀN BỘ video (limit=None).
-    - Lấy 100 comment/video.
-    - Đẩy lên Notion.
-    """
     logger.info(f"🚀 [START] Background task fetch comments for Channel ID: {channel_id}")
     
     try:
-        # 1. Tạo hoặc lấy Page lưu trữ
+        # 1. Chuẩn bị Page Notion
         repo_page_id = ensure_child_page_exists(notion_key, parent_page_id, "💬 Comments Repository")
         
-        # 2. Thêm header ngày giờ update
+        # Header Log thời gian
         update_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header_block = [{
             "object": "block",
             "type": "heading_3",
             "heading_3": {
-                "rich_text": [
-                    {
-                        "type": "text", 
-                        "text": {"content": f"Update Batch: {update_time}"},
-                        "annotations": {"color": "gray"}
-                    }
-                ]
+                "rich_text": [{"type": "text", "text": {"content": f"Update Batch: {update_time}", "annotations": {"color": "gray"}}}]
             }
         }]
         append_blocks_to_page_safe(notion_key, repo_page_id, header_block)
 
-        # 3. Lấy danh sách video (Uploads playlist)
+        # 2. Lấy danh sách video
         uploads_id = youtube_uploads_playlist_id(yt_key, channel_id)
-        
-        # --- UPDATE 1: limit=None (Lấy toàn bộ video thay vì 20) ---
-        logger.info("... Dang lay TOAN BO danh sach video...")
-        videos = youtube_playlist_videos_basic(yt_key, uploads_id, limit=None)
-        logger.info(f"✅ Tim thay tong cong {len(videos)} videos.")
+        logger.info("... Fetching video list ...")
+        videos = youtube_playlist_videos_basic(yt_key, uploads_id, limit=None) # Lấy toàn bộ
+        logger.info(f"✅ Found {len(videos)} videos. Starting parallel processing...")
 
-        # 4. Lặp qua từng video
-        count_success = 0
-        for i, vid in enumerate(videos):
-            snip = vid.get("snippet", {})
-            v_id = snip.get("resourceId", {}).get("videoId")
-            v_title = snip.get("title", "No Title")
+        # 3. CHẠY SONG SONG (Multithreading)
+        total_success = 0
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Tạo danh sách các task
+            futures = [
+                executor.submit(process_single_video_comments, vid, yt_key, notion_key, repo_page_id) 
+                for vid in videos
+            ]
             
-            if not v_id: continue
+            # Theo dõi tiến độ
+            for i, future in enumerate(futures):
+                try:
+                    result = future.result() # Chờ task hoàn thành
+                    total_success += result
+                    if i % 10 == 0:
+                        logger.info(f"Creating progress: {i}/{len(videos)} videos processed...")
+                except Exception as e:
+                    logger.error(f"Worker exception: {e}")
 
-            logger.info(f"[{i+1}/{len(videos)}] Xu ly: {v_title}")
-
-            # --- UPDATE 2: max_results=100 (Lấy tối đa 100 thread) ---
-            comments = youtube_get_video_comments(yt_key, v_id, max_results=30)
-            
-            if comments:
-                comments.sort(key=lambda c: c.get("likes", 0), reverse=True)
-                # Debug log số lượng reply
-                reply_count = sum(len(c['replies']) for c in comments)
-                logger.info(f"   -> Lay duoc {len(comments)} comments goc & {reply_count} replies.")
-
-                blocks = format_comment_blocks(v_title, f"https://youtu.be/{v_id}", comments)
-                success = append_blocks_to_page_safe(notion_key, repo_page_id, blocks)
-                if success:
-                    count_success += 1
-                
-                # Nghỉ nhẹ để tránh Notion Rate Limit (429) vì gửi nhiều request
-
-        logger.info(f"🏁 [END] Task finished. Updated {count_success} videos.")
+        logger.info(f"🏁 [END] Finished. Successfully updated {total_success}/{len(videos)} videos.")
 
     except Exception as e:
         logger.exception(f"❌ CRITICAL ERROR in task_fetch_comments: {e}")

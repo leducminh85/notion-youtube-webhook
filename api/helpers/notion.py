@@ -848,26 +848,40 @@ def format_comment_blocks(video_title: str, video_url: str, comments: List[dict]
     return [wrapper]
 
 def append_blocks_to_page_safe(notion_api_key: str, page_id: str, blocks: List[dict]) -> bool:
-    """Gửi block lên Notion có chia batch và LOG ERROR"""
+    """Gửi block lên Notion có chia batch và RETRY khi gặp lỗi 429"""
     url = f"https://api.notion.com/v1/blocks/{page_id}/children"
-    chunk_size = 50
+    chunk_size = 50 # Notion cho phép tối đa 100, nhưng để 50 cho an toàn
     all_success = True
 
     for i in range(0, len(blocks), chunk_size):
         batch = blocks[i:i+chunk_size]
-        try:
-            r = requests.patch(url, headers=notion_headers(notion_api_key), json={"children": batch})
+        
+        # Logic Retry: Thử tối đa 3 lần nếu gặp lỗi
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                r = requests.patch(url, headers=notion_headers(notion_api_key), json={"children": batch})
+                
+                if r.status_code == 200:
+                    break # Thành công, thoát vòng lặp retry
+                
+                elif r.status_code == 429: # Lỗi Rate Limit
+                    wait_time = int(r.headers.get("Retry-After", 2)) + (attempt * 2)
+                    logger.warning(f"⚠️ Notion Rate Limit (429). Waiting {wait_time}s to retry...")
+                    time.sleep(wait_time)
+                
+                elif r.status_code >= 500: # Lỗi Server Notion
+                    time.sleep(1)
+                
+                else: # Lỗi Client (400, 401...) -> Không retry
+                    logger.error(f"❌ Notion API Error: {r.status_code} - {r.text}")
+                    all_success = False
+                    break
             
-            if r.status_code >= 300:
-                # IN RA LỖI CHI TIẾT TỪ NOTION
-                logger.error(f"❌ NOTION API ERROR (Append): {r.status_code} - {r.text}")
-                all_success = False
-            else:
-                # logger.info(f"   (Notion Append Batch {i} OK)")
-                pass
+            except Exception as e:
+                logger.error(f"❌ Network Exception: {e}")
+                time.sleep(1)
+                if attempt == max_retries - 1:
+                    all_success = False
 
-        except Exception as e:
-            logger.error(f"❌ Exception sending to Notion: {e}")
-            all_success = False
-            
     return all_success
