@@ -535,8 +535,11 @@ def get_channel_views_monthly():
 
 comment_executor = ThreadPoolExecutor(max_workers=4)
 
-def process_single_video_comments(video, yt_key, notion_key, repo_page_id):
-    """Hàm worker xử lý 1 video"""
+def process_single_video_comments(video, yt_key, notion_key, repo_page_id, limit=None):
+    """
+    Hàm worker xử lý 1 video.
+    limit: Số lượng comment tối đa cần lấy (int) hoặc None (lấy tất cả).
+    """
     try:
         snip = video.get("snippet", {})
         v_id = snip.get("resourceId", {}).get("videoId")
@@ -544,28 +547,28 @@ def process_single_video_comments(video, yt_key, notion_key, repo_page_id):
 
         if not v_id: return 0
 
-        # 1. Lấy toàn bộ comments
-        comments = youtube_get_video_comments(yt_key, v_id, max_results=None)
+        # Truyền limit vào hàm youtube_get_video_comments
+        # Nếu limit=None, hàm youtube sẽ tự động loop lấy hết (như logic ở bước trước)
+        comments = youtube_get_video_comments(yt_key, v_id, max_results=limit)
+        
         if not comments: return 0
 
+        # Sort theo like
         comments.sort(key=lambda c: c.get("likes", 0), reverse=True)
         
-        # Log info
         logger.info(f"   -> {v_title}: Found {len(comments)} comments. Saving...")
 
-        # 2. BƯỚC QUAN TRỌNG: Tạo cái vỏ (Header) trước
-        # Trả về ID của cái Toggle Heading
+        # Tạo Header (Vỏ)
         header_block_id = create_video_header_block(notion_key, repo_page_id, f"{v_title} ({len(comments)})", f"https://youtu.be/{v_id}")
         
         if not header_block_id:
             logger.error(f"❌ Failed to create header for {v_title}")
             return 0
 
-        # 3. Format nội dung (chỉ là list các blocks comment)
+        # Format list comments
         comment_blocks = format_comment_list(comments)
 
-        # 4. Đẩy comment vào TRONG cái vỏ vừa tạo
-        # Hàm append_blocks_to_page_safe dùng được cho cả Page ID và Block ID
+        # Đẩy vào Notion
         success = append_blocks_to_page_safe(notion_key, header_block_id, comment_blocks)
         
         if success:
@@ -575,74 +578,116 @@ def process_single_video_comments(video, yt_key, notion_key, repo_page_id):
     except Exception as e:
         logger.error(f"❌ Error processing video {video.get('snippet', {}).get('title')}: {e}")
         return 0
-    
-def task_fetch_comments(yt_key, notion_key, channel_id, parent_page_id):
-    logger.info(f"🚀 [START] Background task fetch comments for Channel ID: {channel_id}")
+
+
+# 2. Cập nhật hàm Task Background để nhận limit
+def task_fetch_comments(yt_key, notion_key, channel_id, parent_page_id, limit=None):
+    logger.info(f"🚀 [START] Background task fetch comments for Channel ID: {channel_id} | Limit: {limit if limit else 'ALL'}")
     
     try:
-        # 1. Chuẩn bị Page Notion
         repo_page_id = ensure_child_page_exists(notion_key, parent_page_id, "💬 Comments Repository")
         
-        # Header Log thời gian
+        # Header Log
         update_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        limit_text = f"Limit: {limit}" if limit else "Limit: ALL"
         header_block = [{
             "object": "block",
             "type": "heading_3",
             "heading_3": {
-                "rich_text": [{"type": "text", "text": {"content": f"Update Batch: {update_time}", "annotations": {"color": "gray"}}}]
+                "rich_text": [{"type": "text", "text": {"content": f"Update Batch: {update_time} ({limit_text})", "annotations": {"color": "gray"}}}]
             }
         }]
         append_blocks_to_page_safe(notion_key, repo_page_id, header_block)
 
-        # 2. Lấy danh sách video
+        # Lấy list video
         uploads_id = youtube_uploads_playlist_id(yt_key, channel_id)
-        logger.info("... Fetching video list ...")
-        videos = youtube_playlist_videos_basic(yt_key, uploads_id, limit=None) # Lấy toàn bộ
-        logger.info(f"✅ Found {len(videos)} videos. Starting parallel processing...")
+        videos = youtube_playlist_videos_basic(yt_key, uploads_id, limit=None) # Lấy danh sách video vẫn lấy hết
+        logger.info(f"✅ Found {len(videos)} videos. Processing...")
 
-        # 3. CHẠY SONG SONG (Multithreading)
         total_success = 0
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # Tạo danh sách các task
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # Truyền limit xuống worker
             futures = [
-                executor.submit(process_single_video_comments, vid, yt_key, notion_key, repo_page_id) 
+                executor.submit(process_single_video_comments, vid, yt_key, notion_key, repo_page_id, limit) 
                 for vid in videos
             ]
             
-            # Theo dõi tiến độ
             for i, future in enumerate(futures):
                 try:
-                    result = future.result() # Chờ task hoàn thành
+                    result = future.result()
                     total_success += result
                     if i % 10 == 0:
-                        logger.info(f"Creating progress: {i}/{len(videos)} videos processed...")
+                        logger.info(f"Progress: {i}/{len(videos)} videos processed...")
                 except Exception as e:
                     logger.error(f"Worker exception: {e}")
 
-        logger.info(f"🏁 [END] Finished. Successfully updated {total_success}/{len(videos)} videos.")
+        logger.info(f"🏁 [END] Finished. Updated {total_success}/{len(videos)} videos.")
 
     except Exception as e:
         logger.exception(f"❌ CRITICAL ERROR in task_fetch_comments: {e}")
 
-@app.route("/fetch-channel-comments", methods=["POST"])
-def fetch_channel_comments():
-    payload = request.get_json(silent=True)
-    if not payload:
-        return jsonify({"status": "error", "message": "Invalid JSON"}), 400
 
+@app.route("/fetch-channel-comments", methods=["POST", "GET"])
+def fetch_channel_comments():
     try:
-        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
-        notion_api_key = os.environ.get("NOTION_API_KEY")
+        # --- DEBUG LOGGING ---
+        logger.info("⚡️ [WEBHOOK RECEIVED]")
+        logger.info(f"   Headers Keys: {list(request.headers.keys())}") 
         
-        # Lấy page_id từ payload (Notion Automation gửi id của page channel)
-        # Cấu trúc payload tùy thuộc vào cách bạn trigger, thường là {"page_id": "..."} hoặc {"data": {"id": "..."}}
-        data = payload.get("data", {})
-        page_id = data.get("id") or payload.get("page_id")
+        json_body = request.get_json(silent=True, force=True) or {}
+        
+        # --- TÌM PAGE ID ---
+        data_obj = json_body.get("data", {})
+        page_id = (
+            data_obj.get("id") or 
+            json_body.get("page_id") or 
+            json_body.get("id") or 
+            request.args.get("page_id")
+        )
 
         if not page_id:
+            logger.error("❌ Missing Page ID")
             return jsonify({"status": "error", "message": "Missing page_id"}), 400
 
-        # Lấy thông tin Page để tìm URL kênh -> tìm Channel ID
+        # --- TÌM LIMIT (Cập nhật logic lấy từ Header) ---
+        limit_val = None
+        
+        # 1. Tìm trong HEADER (Đây là nơi Notion gửi giá trị tùy chỉnh)
+        # Lưu ý: Header có thể là 'Limit' hoặc 'limit' tùy server xử lý
+        if request.headers.get("Limit"):
+            limit_val = request.headers.get("Limit")
+            logger.info(f"   -> 🎯 Found limit in HEADERS: {limit_val}")
+        elif request.headers.get("limit"):
+            limit_val = request.headers.get("limit")
+            logger.info(f"   -> 🎯 Found limit in HEADERS (lowercase): {limit_val}")
+
+        # 2. Tìm trong JSON Body (Ưu tiên nhì - cho Postman)
+        elif "limit" in json_body:
+            limit_val = json_body["limit"]
+            logger.info(f"   -> Found limit in JSON: {limit_val}")
+            
+        # 3. Tìm trong URL Query Params
+        elif "limit" in request.args:
+            limit_val = request.args["limit"]
+            logger.info(f"   -> Found limit in URL: {limit_val}")
+
+        # --- Xử lý giá trị Limit (Convert sang int) ---
+        final_limit = None
+        if limit_val is not None:
+            str_val = str(limit_val).strip().lower()
+            if str_val not in ["", "none", "null"]:
+                try:
+                    final_limit = int(str_val)
+                except ValueError:
+                    logger.warning(f"⚠️ Invalid limit value: {limit_val}. Using ALL.")
+                    final_limit = None
+
+        logger.info(f"✅ FINAL DECISION: PageID={page_id}, Limit={final_limit}")
+
+        # --- LOGIC XỬ LÝ CHÍNH ---
+        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
+        notion_api_key = os.environ.get("NOTION_API_KEY")
+
         page = notion_retrieve_page(notion_api_key, page_id)
         props = page.get("properties", {})
         channel_url = get_property_value(props, "Channel URL")
@@ -652,17 +697,17 @@ def fetch_channel_comments():
 
         channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
 
-        # Đẩy vào background chạy để trả response ngay cho Notion đỡ đợi
-        comment_executor.submit(task_fetch_comments, yt_api_key, notion_api_key, channel_id, page_id)
+        comment_executor.submit(task_fetch_comments, yt_api_key, notion_api_key, channel_id, page_id, final_limit)
 
         return jsonify({
             "status": "success", 
-            "message": "Processing comments in background. Check '💬 Comments Repository' page shortly."
+            "message": f"Processing started. Limit: {final_limit if final_limit else 'ALL'}"
         }), 200
 
     except Exception as e:
         logger.exception(f"Endpoint error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
+    
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 3000))
+#     app.run(host="0.0.0.0", port=port)
