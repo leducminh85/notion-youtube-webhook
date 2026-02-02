@@ -450,9 +450,9 @@ def sync_combined_daily_stats_rows(
 
     # 3. Tìm các row cũ không còn trong 30 ngày này để xóa (Cleanup)
     to_delete = []
-    for date_str, page_id in existing_map.items():
-        if date_str not in processed_dates:
-            to_delete.append(page_id)
+    # for date_str, page_id in existing_map.items():
+    #     if date_str not in processed_dates:
+    #         to_delete.append(page_id)
 
     # 4. Thực thi song song
     logger.info(f"Daily Sync '{channel_name}': {len(to_update)} updates, {len(to_insert)} inserts, {len(to_delete)} deletes.")
@@ -627,9 +627,9 @@ def sync_combined_monthly_stats_rows(
 
     # 3. Cleanup (Xóa các tháng cũ không còn trong list trả về - optional, nhưng tốt cho sync)
     to_delete = []
-    for d_str, pid in existing_map.items():
-        if d_str not in processed_months:
-            to_delete.append(pid)
+    # for d_str, pid in existing_map.items():
+    #     if d_str not in processed_months:
+    #         to_delete.append(pid)
 
     # 4. Thực thi song song
     logger.info(f"Monthly Sync '{channel_name}': {len(to_update)} updates, {len(to_insert)} inserts.")
