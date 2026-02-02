@@ -13,6 +13,7 @@ from .helpers.youtube import (
 )
 from .helpers.notion import (
     calculate_monthly_views_gained,
+    deactivate_channel_stats_rows,
     ensure_combined_monthly_stats_database,
     notion_headers,
     notion_get_database_schema,
@@ -706,6 +707,69 @@ def fetch_channel_comments():
 
     except Exception as e:
         logger.exception(f"Endpoint error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+
+@app.route("/delete-channel", methods=["POST"])
+def delete_channel():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+
+    try:
+        yt_api_key = os.environ.get("YOUTUBE_API_KEY")
+        notion_api_key = os.environ.get("NOTION_API_KEY")
+        
+        data = payload.get("data", {})
+        page_id = data.get("id") or payload.get("page_id")
+        
+        if not page_id:
+            raise ValueError("Missing page_id")
+
+        # 1. Lấy thông tin Page Channel để tìm URL
+        page = notion_retrieve_page(notion_api_key, page_id)
+        props = page.get("properties", {})
+        channel_url = get_property_value(props, "Channel URL")
+        
+        if not channel_url:
+            raise ValueError("Missing property: Channel URL")
+
+        # 2. Lấy tên kênh chuẩn từ YouTube (vì trong DB Stats lưu theo tên chuẩn này)
+        channel_id = youtube_channel_id_from_url(yt_api_key, channel_url)
+        stats = youtube_get_channel_stats(yt_api_key, channel_id)
+        channel_title = stats["title"] # Key quan trọng để tìm row
+
+        # 3. Tìm Parent Page ID (Page tổng chứa các DB thống kê)
+        triggering_db_id = page.get("parent", {}).get("database_id")
+        if not triggering_db_id:
+            raise ValueError("Page Channel không nằm trong database")
+            
+        page_tong_id = get_page_tong_id_from_database(notion_api_key, triggering_db_id)
+
+        # 4. Lấy/Tìm ID của 2 Database thống kê (Daily & Monthly)
+        # Hàm ensure_... sẽ trả về ID của DB nếu đã tồn tại
+        daily_db_id = ensure_combined_daily_stats_database(notion_api_key, page_tong_id)
+        monthly_db_id = ensure_combined_monthly_stats_database(notion_api_key, page_tong_id)
+
+        # 5. Thực hiện De-active
+        # Dùng ThreadPool để chạy song song 2 DB cho nhanh
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(deactivate_channel_stats_rows, notion_api_key, daily_db_id, channel_title)
+            f2 = executor.submit(deactivate_channel_stats_rows, notion_api_key, monthly_db_id, channel_title)
+            
+            count_daily = f1.result()
+            count_monthly = f2.result()
+
+        return jsonify({
+            "status": "success",
+            "message": f"Channel '{channel_title}' deactivated in stats.",
+            "channel_title": channel_title,
+            "daily_rows_deactivated": count_daily,
+            "monthly_rows_deactivated": count_monthly
+        }), 200
+
+    except Exception as e:
+        logger.exception(f"/delete-channel failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
     
 # if __name__ == "__main__":

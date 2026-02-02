@@ -1032,3 +1032,67 @@ def format_comment_list(comments: List[dict]) -> List[dict]:
         })
         
     return blocks
+
+
+
+def deactivate_channel_stats_rows(notion_api_key: str, db_id: str, channel_name: str) -> int:
+    """
+    Tìm tất cả các row thuộc channel_name trong database và set 'Is Active' = False.
+    """
+    channel_name = channel_name.strip()
+    pages_to_update = []
+    
+    # 1. Query tìm tất cả các dòng của Channel đó
+    has_more = True
+    next_cursor = None
+    
+    while has_more:
+        query_payload = {
+            "page_size": 100,
+            "filter": {
+                "property": "Channel",
+                "title": {"equals": channel_name}
+            }
+        }
+        if next_cursor:
+            query_payload["start_cursor"] = next_cursor
+
+        try:
+            r = requests.post(
+                f"https://api.notion.com/v1/databases/{db_id}/query",
+                headers=notion_headers(notion_api_key),
+                json=query_payload
+            )
+            if r.status_code != 200:
+                logger.error(f"Query failed in deactivate: {r.text}")
+                break
+            
+            res = r.json()
+            for page in res.get("results", []):
+                # Chỉ update nếu Is Active đang là True (để tiết kiệm request)
+                props = page.get("properties", {})
+                is_active = props.get("Is Active", {}).get("checkbox", False)
+                if is_active:
+                    pages_to_update.append(page["id"])
+            
+            has_more = res.get("has_more", False)
+            next_cursor = res.get("next_cursor")
+            
+        except Exception as e:
+            logger.error(f"Error querying db {db_id}: {e}")
+            break
+
+    # 2. Chuẩn bị payload update
+    to_update_list = []
+    for pid in pages_to_update:
+        # Tuple (page_id, properties_dict)
+        to_update_list.append((pid, {"Is Active": {"checkbox": False}}))
+
+    if not to_update_list:
+        return 0
+
+    # 3. Thực thi update hàng loạt (tận dụng hàm helper có sẵn)
+    logger.info(f"Deactivating {len(to_update_list)} rows for '{channel_name}' in DB {db_id}")
+    _execute_batch_actions(notion_api_key, to_update=to_update_list, to_insert=[], to_delete=[])
+    
+    return len(to_update_list)
