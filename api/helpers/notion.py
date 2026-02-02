@@ -419,7 +419,7 @@ def sync_combined_daily_stats_rows(
     
     # Chỉ lấy 30 ngày gần nhất để sync
     sorted_stats = sorted(daily_stats, key=lambda x: x.get("date", 0), reverse=True)
-    recent_30_days = sorted_stats[:30]
+    recent_30_days = sorted_stats[:31]
     
     processed_dates = set()
 
