@@ -282,7 +282,8 @@ def ensure_daily_stats_database(notion_api_key: str, parent_page_id: str) -> str
 			"Views": {"number": {"format": "number"}},
 			"Views Change": {"number": {"format": "number"}},
 			"Subscribers": {"number": {"format": "number"}},
-			"Subscribers Change": {"number": {"format": "number"}}
+			"Subscribers Change": {"number": {"format": "number"}},
+			"Is Active": {"checkbox": {}}
 		}
 	}
 	r = requests.post(
@@ -314,9 +315,25 @@ def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: st
                         title += part.get("plain_text", "") or part.get("text", {}).get("content", "")
                     elif isinstance(part, str):
                         title += part
+                
                 if title.strip() == "Combined Daily Stats":
-                    return block["id"]
+                    db_id = block["id"]
+                    # --- FIX: Kiểm tra và thêm cột "Is Active" nếu thiếu ---
+                    try:
+                        schema = notion_get_database_schema(notion_api_key, db_id)
+                        if "Is Active" not in schema:
+                            logger.info(f"Database {db_id} thiếu cột 'Is Active'. Đang cập nhật...")
+                            requests.patch(
+                                f"https://api.notion.com/v1/databases/{db_id}",
+                                headers=notion_headers(notion_api_key),
+                                json={"properties": {"Is Active": {"checkbox": {}}}}
+                            )
+                    except Exception as e:
+                        logger.warning(f"Không thể cập nhật schema cho Daily Stats: {e}")
+                    # -------------------------------------------------------
+                    return db_id
 
+    # Nếu chưa có DB thì tạo mới (đã bao gồm Is Active)
     payload = {
         "parent": {"type": "page_id", "page_id": parent_page_id},
         "title": [{"type": "text", "text": {"content": "Combined Daily Stats"}}],
@@ -326,6 +343,7 @@ def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: st
             "Subscribers": {"number": {"format": "number"}},
             "Total Views": {"number": {"format": "number"}},
             "Views Change": {"number": {"format": "number"}},
+            "Is Active": {"checkbox": {}}
         }
     }
     r = requests.post(
@@ -339,7 +357,6 @@ def ensure_combined_daily_stats_database(notion_api_key: str, parent_page_id: st
 
     logger.info("Đã tạo mới Combined Daily Stats database")
     return r.json()["id"]
-
 
 def sync_combined_daily_stats_rows(
     notion_api_key: str,
@@ -420,6 +437,7 @@ def sync_combined_daily_stats_rows(
             "Subscribers": {"number": stat.get("subscribers")},
             "Total Views": {"number": stat.get("views")},
             "Views Change": {"number": stat.get("views_change")},
+            "Is Active": {"checkbox": True}
         }
 
         if dt_str in existing_map:
@@ -492,8 +510,23 @@ def ensure_combined_monthly_stats_database(notion_api_key: str, parent_page_id: 
                     for part in title_parts
                 )
                 if title.strip() == "Combined Monthly Stats":
-                    return block["id"]
+                    db_id = block["id"]
+                    # --- FIX: Kiểm tra và thêm cột "Is Active" nếu thiếu ---
+                    try:
+                        schema = notion_get_database_schema(notion_api_key, db_id)
+                        if "Is Active" not in schema:
+                            logger.info(f"Database {db_id} thiếu cột 'Is Active'. Đang cập nhật...")
+                            requests.patch(
+                                f"https://api.notion.com/v1/databases/{db_id}",
+                                headers=notion_headers(notion_api_key),
+                                json={"properties": {"Is Active": {"checkbox": {}}}}
+                            )
+                    except Exception as e:
+                        logger.warning(f"Không thể cập nhật schema cho Monthly Stats: {e}")
+                    # -------------------------------------------------------
+                    return db_id
 
+    # Nếu chưa có DB thì tạo mới
     payload = {
         "parent": {"type": "page_id", "page_id": parent_page_id},
         "title": [{"type": "text", "text": {"content": "Combined Monthly Stats"}}],
@@ -502,6 +535,7 @@ def ensure_combined_monthly_stats_database(notion_api_key: str, parent_page_id: 
             "Month": {"date": {}},
             "Views Gained": {"number": {"format": "number"}},
             "Total Views": {"number": {"format": "number"}},
+            "Is Active": {"checkbox": {}}
         }
     }
     r = requests.post(
@@ -515,7 +549,6 @@ def ensure_combined_monthly_stats_database(notion_api_key: str, parent_page_id: 
 
     logger.info("Đã tạo mới Combined Monthly Stats database")
     return r.json()["id"]
-
 
 def sync_combined_monthly_stats_rows(
     notion_api_key: str,
@@ -584,6 +617,7 @@ def sync_combined_monthly_stats_rows(
             "Month": {"date": {"start": date_start}},
             "Views Gained": {"number": item["views_gained"]},
             "Total Views": {"number": item["total_views_at_end"]},
+            "Is Active": {"checkbox": True}  
         }
 
         if date_start in existing_map:
