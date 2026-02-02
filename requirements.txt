@@ -2,3 +2,4 @@ flask
 requests
 curl_cffi
 datetime
+gunicorn
